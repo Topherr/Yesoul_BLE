@@ -1,51 +1,46 @@
-// Yesoul_BLE bridge: subscribes to a Yesoul G1M Plus FTMS Indoor Bike Data
-// stream and re-broadcasts the data as a standard Cycling Power Service +
-// Cycling Speed and Cadence Service so Garmin Edge / watch can consume it.
+// Yesoul_BLE bridge — single-ESP experiment.
+//
+// Same goal as master (bike → watch as power + cadence + speed + distance) but
+// running on ONE ESP32 using BLE 5.0 extended advertising with two advertising
+// instances at distinct random-static addresses. The watch sees them as two
+// separate sensors and pairs each under its respective category, while sharing
+// one GATT server (both CPS and CSC services). If this works, the dual-ESP
+// architecture on master becomes redundant.
+//
+// Build flag CONFIG_BT_NIMBLE_EXT_ADV=1 (set in platformio.ini) is required.
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
-#include <WiFi.h>
-#include <esp_now.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include "ftms_parser.h"
 
-// ---- Configuration ----
-// Empirical findings (2026-04-30):
-//   1. Garmin epix 2's "Add Sensor → Speed" filter rejects devices that also
-//      expose CPS — only CSC-only peripherals are listed. So we ship two ESPs:
-//      one CPS-only (POWER), one CSC-only (SPEED).
-//   2. The Yesoul allows only one BLE central. The POWER ESP owns the bike
-//      connection; the SPEED ESP receives parsed BikeFrames via ESP-NOW relay.
-// Role is selected via build flag in platformio.ini (-DDEVICE_ROLE_POWER or
-// -DDEVICE_ROLE_SPEED). See docs/ARCHITECTURE.md and docs/JOURNEY.md.
-enum class Role { POWER, SPEED };
-#if defined(DEVICE_ROLE_POWER)
-static constexpr Role     DEVICE_ROLE              = Role::POWER;
-#elif defined(DEVICE_ROLE_SPEED)
-static constexpr Role     DEVICE_ROLE              = Role::SPEED;
-#else
-#error "Define DEVICE_ROLE_POWER or DEVICE_ROLE_SPEED via -D in platformio.ini"
+#if !CONFIG_BT_NIMBLE_EXT_ADV
+#error "CONFIG_BT_NIMBLE_EXT_ADV must be enabled — add -DCONFIG_BT_NIMBLE_EXT_ADV=1 to build_flags."
 #endif
-static constexpr bool     IS_POWER                 = (DEVICE_ROLE == Role::POWER);
-static constexpr bool     IS_SPEED                 = (DEVICE_ROLE == Role::SPEED);
-static constexpr const char* DEVICE_NAME           = IS_POWER ? "Yesoul_PWR" : "Yesoul_SPD";
-static constexpr uint16_t DEVICE_APPEARANCE        = IS_POWER ? 0x0484 : 0x0482;  // 0x0484 = Cycling Power Sensor, 0x0482 = Cycling Speed Sensor
 
-// SIMULATE_BIKE: bypass bike-side scan/connect entirely and inject realistic
-// mid-ride values into the publish pipeline. Useful for verifying pairing
-// flows without pedaling. Default false → real bike.
-static constexpr bool     SIMULATE_BIKE            = false;
-static constexpr uint16_t SIM_SPEED_CMPS           = 2000;    // 20.00 km/h
-static constexpr uint16_t SIM_CADENCE_HALFRPM      = 120;     // 60 RPM
-static constexpr int16_t  SIM_INST_POWER_W         = 150;
-
+// ---- Configuration ----
 static constexpr float    POWER_SCALE              = 1.28f;
 static constexpr float    WHEEL_CIRCUMFERENCE_M    = 2.000f;
 static constexpr uint32_t NOTIFICATION_WATCHDOG_MS = 5000;
 static constexpr uint32_t COOLDOWN_MS              = 1000;
 static constexpr uint32_t SCAN_BACKOFF_INITIAL_MS  = 5000;
 static constexpr uint32_t SCAN_BACKOFF_MAX_MS      = 60000;
+
+// Two distinct random-static addresses. Top two bits of byte 0 must be 11
+// (i.e. byte 0 in 0xC0..0xFF) for a valid random-static identity address.
+static constexpr const char* PWR_ADDRESS  = "F1:0A:5E:00:00:01";
+static constexpr const char* SPD_ADDRESS  = "F1:0A:5E:00:00:02";
+static constexpr const char* PWR_NAME     = "Yesoul_PWR";
+static constexpr const char* SPD_NAME     = "Yesoul_SPD";
+static constexpr uint16_t    PWR_APPEAR   = 0x0484;  // Cycling Power Sensor
+static constexpr uint16_t    SPD_APPEAR   = 0x0482;  // Cycling Speed Sensor
+
+// Bike-data simulation (skip the bike, inject constant values). Default false.
+static constexpr bool     SIMULATE_BIKE            = false;
+static constexpr uint16_t SIM_SPEED_CMPS           = 2000;
+static constexpr uint16_t SIM_CADENCE_HALFRPM      = 120;
+static constexpr int16_t  SIM_INST_POWER_W         = 150;
 
 // ---- BLE UUIDs ----
 static const NimBLEUUID FTMS_SERVICE_UUID("1826");
@@ -62,20 +57,14 @@ static const NimBLEUUID CSC_FEATURE_UUID("2A5C");
 static const NimBLEUUID CSC_SC_CONTROL_POINT_UUID("2A55");
 
 // ---- Bike-side state machine ----
-enum BikeState {
-  S_SCANNING,
-  S_CONNECTED,
-  S_STREAMING,
-  S_DISCONNECTED,
-  S_COOLDOWN,
-};
+enum BikeState { S_SCANNING, S_CONNECTED, S_STREAMING, S_DISCONNECTED, S_COOLDOWN };
 
-static volatile BikeState g_state                  = S_SCANNING;
-static volatile uint32_t  g_last_notification_ms   = 0;
-static volatile bool      g_doConnect              = false;
-static uint32_t           g_scan_backoff_ms        = SCAN_BACKOFF_INITIAL_MS;
-static uint32_t           g_cooldown_started_ms    = 0;
-static uint32_t           g_consecutive_failures   = 0;
+static volatile BikeState g_state                = S_SCANNING;
+static volatile uint32_t  g_last_notification_ms = 0;
+static volatile bool      g_doConnect            = false;
+static uint32_t           g_scan_backoff_ms      = SCAN_BACKOFF_INITIAL_MS;
+static uint32_t           g_cooldown_started_ms  = 0;
+static uint32_t           g_consecutive_failures = 0;
 
 static NimBLEClient*           g_pClient = nullptr;
 static NimBLEAdvertisedDevice* g_pTarget = nullptr;
@@ -91,62 +80,60 @@ static volatile uint16_t g_speed_cmps      = 0;
 static volatile uint16_t g_cadence_halfrpm = 0;
 static volatile int16_t  g_inst_power_w    = 0;
 
-// Cumulative counters persist across bike-side reconnects; reset only when the
-// last Garmin client disconnects, so the head-unit doesn't see counter resets
-// mid-ride.
 static float    g_wheel_revs_accum      = 0.0f;
 static float    g_crank_revs_accum      = 0.0f;
 static uint32_t g_cumulative_wheel_revs = 0;
 static uint16_t g_cumulative_crank_revs = 0;
-// CSC uses 1/1024 s for both wheel and crank event times.
 static uint16_t g_last_wheel_event_time_1024 = 0;
 static uint16_t g_last_crank_event_time_1024 = 0;
-static uint32_t g_last_csc_update_ms         = 0;
-static uint32_t g_last_publish_ms            = 0;
+static uint32_t g_last_csc_update_ms    = 0;
+static uint32_t g_last_publish_ms       = 0;
+static volatile uint32_t g_notify_count = 0;
 
-// ---- Server (Garmin-facing) callbacks ----
+// ---- Server callbacks ----
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
-    Serial.printf("[srv] client connected: %s\n", connInfo.getAddress().toString().c_str());
+    Serial.printf("[srv] client connected: %s (handle=%u, total=%u)\n",
+                  connInfo.getAddress().toString().c_str(),
+                  connInfo.getConnHandle(),
+                  pServer->getConnectedCount());
     pServer->updateConnParams(connInfo.getConnHandle(), 24, 48, 0, 60);
-    NimBLEDevice::startAdvertising();
   }
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
-    Serial.printf("[srv] client disconnected (reason=0x%x)\n", reason);
+    Serial.printf("[srv] client disconnected (reason=0x%x, remaining=%u)\n",
+                  reason, pServer->getConnectedCount());
     if (pServer->getConnectedCount() == 0) {
-      g_wheel_revs_accum = 0;
-      g_crank_revs_accum = 0;
+      g_wheel_revs_accum      = 0;
+      g_crank_revs_accum      = 0;
       g_cumulative_wheel_revs = 0;
       g_cumulative_crank_revs = 0;
     }
-    NimBLEDevice::startAdvertising();
   }
 };
 
-// SC Control Point: ACK Set Cumulative Value (op 1) as a no-op success;
-// Op Code Not Supported for everything else. Garmin watches require this
-// characteristic to exist for the CSC sensor to be discoverable.
+// SC Control Point: ACK Set Cumulative Value as no-op success; Op Code Not
+// Supported for everything else. Garmin watches require this to exist.
 class SCControlPointCallbacks : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& /*connInfo*/) override {
-    NimBLEAttValue val = pCharacteristic->getValue();
+  void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo&) override {
+    NimBLEAttValue val = pChar->getValue();
     if (val.length() == 0) return;
     uint8_t op = val[0];
-    uint8_t resp[3] = { 0x10, op, 0x02 };  // default: Op Code Not Supported
+    uint8_t resp[3] = { 0x10, op, 0x02 };
     if (op == 1 && val.length() >= 5) {
       uint32_t newVal = (uint32_t)val[1] | ((uint32_t)val[2] << 8) |
                         ((uint32_t)val[3] << 16) | ((uint32_t)val[4] << 24);
       g_wheel_revs_accum      = (float)newVal;
       g_cumulative_wheel_revs = newVal;
-      resp[2] = 0x01;  // Success
+      resp[2] = 0x01;
     }
-    pCharacteristic->setValue(resp, 3);
-    pCharacteristic->indicate();
+    pChar->setValue(resp, 3);
+    pChar->indicate();
   }
 };
 
 // ---- Bike-side (client) callbacks ----
 class ClientCallbacks : public NimBLEClientCallbacks {
-  void onDisconnect(NimBLEClient* pClient, int reason) override {
+  void onDisconnect(NimBLEClient*, int reason) override {
     Serial.printf("[bike] disconnected (reason=0x%x)\n", reason);
     g_state = S_DISCONNECTED;
   }
@@ -155,10 +142,7 @@ class ClientCallbacks : public NimBLEClientCallbacks {
 class ScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* dev) override {
     if (g_state != S_SCANNING) return;
-    // Match on FTMS service UUID alone; the Yesoul doesn't always advertise
-    // a name and the user only has one FTMS device in their environment.
     if (!dev->haveServiceUUID() || !dev->isAdvertisingService(FTMS_SERVICE_UUID)) return;
-
     Serial.printf("[bike] FTMS target found: '%s' @ %s\n",
                   dev->getName().c_str(), dev->getAddress().toString().c_str());
     NimBLEDevice::getScan()->stop();
@@ -168,58 +152,17 @@ class ScanCallbacks : public NimBLEScanCallbacks {
   }
 } g_scanCallbacks;
 
-// notifyCallback runs on the BLE host task — do nothing heavy.
-static volatile uint32_t g_notify_count = 0;
-
-// ESP-NOW relay: the Yesoul allows only one BLE central, so the POWER ESP owns
-// the bike connection and broadcasts each parsed BikeFrame to the SPEED ESP
-// via ESP-NOW. Both ESPs sit on the same 2.4 GHz radio sharing time with BLE.
-static const uint8_t ESPNOW_BROADCAST_ADDR[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-
-static void OnEspNowRecv(const uint8_t* /*mac*/, const uint8_t* data, int len) {
-  if (len != (int)sizeof(BikeFrame)) return;
-  BikeFrame frame;
-  memcpy(&frame, data, sizeof(BikeFrame));
-  frame.millis_received = millis();
-  xQueueSend(g_frameQueue, &frame, 0);
-  g_last_notification_ms = millis();
-  g_notify_count++;
-}
-
-static void setup_espnow() {
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("[espnow] init FAILED");
-    return;
-  }
-  esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, ESPNOW_BROADCAST_ADDR, 6);
-  peer.channel = 0;
-  peer.encrypt = false;
-  esp_now_add_peer(&peer);
-  if (IS_SPEED) {
-    esp_now_register_recv_cb(OnEspNowRecv);
-  }
-  Serial.printf("[espnow] init OK (%s)\n", IS_POWER ? "broadcasting" : "receiving");
-}
-
-static void notifyCallback(NimBLERemoteCharacteristic* /*chr*/, uint8_t* pData,
-                           size_t len, bool /*isNotify*/) {
+static void notifyCallback(NimBLERemoteCharacteristic*, uint8_t* pData,
+                           size_t len, bool) {
   BikeFrame frame{};
   if (parse_indoor_bike_data(pData, len, frame)) {
     frame.millis_received = millis();
     xQueueSend(g_frameQueue, &frame, 0);
-    if (IS_POWER) {
-      // Relay to SPEED ESP. Best-effort; we don't care if any single send drops.
-      esp_now_send(ESPNOW_BROADCAST_ADDR, (const uint8_t*)&frame, sizeof(frame));
-    }
   }
   g_last_notification_ms = millis();
   g_notify_count++;
 }
 
-// ---- helpers ----
 static bool connect_to_target() {
   if (!g_pTarget) return false;
   if (g_pClient) {
@@ -246,7 +189,7 @@ static bool connect_to_target() {
 }
 
 static void start_scan() {
-  Serial.printf("[bike] scanning...\n");
+  Serial.println("[bike] scanning...");
   g_state = S_SCANNING;
   NimBLEDevice::getScan()->start(0, false, true);
 }
@@ -275,30 +218,22 @@ static void update_revolution_counters() {
 }
 
 static void publish_cps_frame() {
-  // CPS Measurement, flags 0x0020 (crank-rev only). Garmin watches read power
-  // and cadence from CPS; speed comes from CSC. Sending wheel-rev here too
-  // triggers Garmin's documented duplicate-counting bug → 2x speed.
-  // 0-1 flags, 2-3 inst power (sint16), 4-5 crank revs (uint16),
-  // 6-7 last crank event time (uint16, 1/1024 s).
+  // CPS Measurement, flags 0x0020 (crank-rev only). 8 bytes.
   int16_t pwr = (int16_t)(g_inst_power_w * POWER_SCALE);
   uint16_t flags = 0x0020;
   uint8_t buf[8];
-  buf[0] = flags & 0xff;
-  buf[1] = (flags >> 8) & 0xff;
-  buf[2] = pwr & 0xff;
-  buf[3] = (pwr >> 8) & 0xff;
-  buf[4] = g_cumulative_crank_revs        & 0xff;
-  buf[5] = (g_cumulative_crank_revs >> 8)  & 0xff;
-  buf[6] = g_last_crank_event_time_1024        & 0xff;
+  buf[0] = flags & 0xff;       buf[1] = (flags >> 8) & 0xff;
+  buf[2] = pwr & 0xff;         buf[3] = (pwr >> 8) & 0xff;
+  buf[4] = g_cumulative_crank_revs & 0xff;
+  buf[5] = (g_cumulative_crank_revs >> 8) & 0xff;
+  buf[6] = g_last_crank_event_time_1024 & 0xff;
   buf[7] = (g_last_crank_event_time_1024 >> 8) & 0xff;
   g_cpsMeasurement->setValue(buf, 8);
   g_cpsMeasurement->notify();
 }
 
 static void publish_csc_frame() {
-  // CSC Measurement, flags 0x01 (wheel-rev only). 7-byte frame:
-  // 0 flags, 1-4 cumulative wheel revs (uint32), 5-6 last wheel event time (uint16, 1/1024 s).
-  // Crank-rev intentionally omitted; it lives on CPS only.
+  // CSC Measurement, flags 0x01 (wheel-rev only). 7 bytes.
   uint8_t buf[7];
   buf[0] = 0x01;
   buf[1] = g_cumulative_wheel_revs        & 0xff;
@@ -315,9 +250,9 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   Serial.println();
-  Serial.println("=== Yesoul_BLE bridge ===");
-  Serial.printf("Power scale: %.3f\n", (double)POWER_SCALE);
-  Serial.printf("Wheel circumference: %.3f m\n", (double)WHEEL_CIRCUMFERENCE_M);
+  Serial.println("=== Yesoul_BLE single-ESP experiment ===");
+  Serial.printf("Power scale: %.3f, wheel: %.3f m\n",
+                (double)POWER_SCALE, (double)WHEEL_CIRCUMFERENCE_M);
   if (SIMULATE_BIKE) {
     Serial.printf("[sim] BIKE SIMULATION ENABLED — speed=%.2fkmh, cadence=%uRPM, raw_power=%dW\n",
                   SIM_SPEED_CMPS / 100.0, SIM_CADENCE_HALFRPM / 2, (int)SIM_INST_POWER_W);
@@ -325,75 +260,82 @@ void setup() {
 
   g_frameQueue = xQueueCreate(8, sizeof(BikeFrame));
 
-  NimBLEDevice::init(DEVICE_NAME);
+  NimBLEDevice::init("Yesoul");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-  // Bonding intentionally OFF. Tried bonding (setSecurityAuth(true, false, false))
-  // but stale-bond mismatch was preventing the Garmin from re-pairing after the
-  // user removed the sensor on its side. With no bond, every reconnect is a
-  // fresh pair — slightly noisier UX but reliable. Re-enable later if needed.
   Serial.printf("[srv] %d bonds in NVS, clearing\n", NimBLEDevice::getNumBonds());
   NimBLEDevice::deleteAllBonds();
+
+  uint8_t loc[1] = { 0x0D };  // Rear Hub.
 
   g_pServer = NimBLEDevice::createServer();
   g_pServer->setCallbacks(new ServerCallbacks());
 
-  uint8_t loc[1] = { 0x0D };  // Rear Hub.
+  // ---- CSC service (registered first so the GATT handle ordering puts CSC
+  //      ahead of CPS in discovery, matching what worked in the dual-ESP
+  //      build and minimising risk that the watch trips on order). ----
+  NimBLEService* csc = g_pServer->createService(CSC_SERVICE_UUID);
+  NimBLECharacteristic* cscFeature = csc->createCharacteristic(CSC_FEATURE_UUID, NIMBLE_PROPERTY::READ);
+  uint8_t cscFeatureValue[2] = { 0x01, 0x00 };
+  cscFeature->setValue(cscFeatureValue, 2);
+  NimBLECharacteristic* cscLoc = csc->createCharacteristic(CPS_SENSOR_LOCATION_UUID, NIMBLE_PROPERTY::READ);
+  cscLoc->setValue(loc, 1);
+  g_cscMeasurement = csc->createCharacteristic(CSC_MEASUREMENT_UUID,
+                                               NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  uint8_t initCsc[7] = {0};
+  g_cscMeasurement->setValue(initCsc, 7);
+  NimBLECharacteristic* scControlPoint = csc->createCharacteristic(
+      CSC_SC_CONTROL_POINT_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
+  scControlPoint->setCallbacks(new SCControlPointCallbacks());
 
-  if (IS_POWER) {
-    // ---- CPS service (this ESP plays the role of a power meter) ----
-    NimBLEService* cps = g_pServer->createService(CPS_SERVICE_UUID);
+  // ---- CPS service ----
+  NimBLEService* cps = g_pServer->createService(CPS_SERVICE_UUID);
+  NimBLECharacteristic* cpsFeature = cps->createCharacteristic(CPS_FEATURE_UUID, NIMBLE_PROPERTY::READ);
+  uint8_t cpsFeatureValue[4] = { 0x08, 0x00, 0x00, 0x00 };
+  cpsFeature->setValue(cpsFeatureValue, 4);
+  NimBLECharacteristic* cpsLoc = cps->createCharacteristic(CPS_SENSOR_LOCATION_UUID, NIMBLE_PROPERTY::READ);
+  cpsLoc->setValue(loc, 1);
+  g_cpsMeasurement = cps->createCharacteristic(CPS_MEASUREMENT_UUID,
+                                               NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  uint8_t initCps[8] = {0};
+  g_cpsMeasurement->setValue(initCps, 8);
 
-    NimBLECharacteristic* cpsFeature = cps->createCharacteristic(CPS_FEATURE_UUID, NIMBLE_PROPERTY::READ);
-    // CPS Feature, little-endian uint32. Bit 3 = "Crank Revolution Data Supported".
-    uint8_t cpsFeatureValue[4] = { 0x08, 0x00, 0x00, 0x00 };
-    cpsFeature->setValue(cpsFeatureValue, 4);
-
-    NimBLECharacteristic* cpsLoc = cps->createCharacteristic(CPS_SENSOR_LOCATION_UUID, NIMBLE_PROPERTY::READ);
-    cpsLoc->setValue(loc, 1);
-
-    g_cpsMeasurement = cps->createCharacteristic(CPS_MEASUREMENT_UUID,
-                                                 NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-    uint8_t initCps[8] = {0};
-    g_cpsMeasurement->setValue(initCps, 8);
-  } else {
-    // ---- CSC service (this ESP plays the role of a speed sensor) ----
-    NimBLEService* csc = g_pServer->createService(CSC_SERVICE_UUID);
-
-    NimBLECharacteristic* cscFeature = csc->createCharacteristic(CSC_FEATURE_UUID, NIMBLE_PROPERTY::READ);
-    // CSC Feature, little-endian uint16. Bit 0 = "Wheel Revolution Data Supported" only.
-    uint8_t cscFeatureValue[2] = { 0x01, 0x00 };
-    cscFeature->setValue(cscFeatureValue, 2);
-
-    NimBLECharacteristic* cscLoc = csc->createCharacteristic(CPS_SENSOR_LOCATION_UUID, NIMBLE_PROPERTY::READ);
-    cscLoc->setValue(loc, 1);
-
-    g_cscMeasurement = csc->createCharacteristic(CSC_MEASUREMENT_UUID,
-                                                 NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-    uint8_t initCsc[7] = {0};
-    g_cscMeasurement->setValue(initCsc, 7);
-
-    NimBLECharacteristic* scControlPoint = csc->createCharacteristic(
-        CSC_SC_CONTROL_POINT_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
-    scControlPoint->setCallbacks(new SCControlPointCallbacks());
-  }
-
-  // Register all services with the GATT database. Required in NimBLE 2.x —
-  // without this, services may advertise but not be discoverable on connect.
   g_pServer->start();
 
-  // ---- Advertising ----
-  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->addServiceUUID(IS_POWER ? CPS_SERVICE_UUID : CSC_SERVICE_UUID);
-  adv->setAppearance(DEVICE_APPEARANCE);
-  adv->setName(DEVICE_NAME);
-  adv->enableScanResponse(false);
-  adv->start();
-  Serial.printf("[srv] advertising as %s (role=%s)\n", DEVICE_NAME, IS_POWER ? "POWER/CPS" : "SPEED/CSC");
+  // ---- Two extended-advertising instances at distinct random-static
+  //      addresses. Each instance only advertises ONE service UUID — the
+  //      watch's category-specific scan filters on advertised UUIDs, so
+  //      each address is invisible to the wrong category. ----
+  NimBLEExtAdvertisement powerAdv;
+  powerAdv.setLegacyAdvertising(true);
+  powerAdv.setConnectable(true);
+  powerAdv.setScannable(true);
+  powerAdv.setAddress(NimBLEAddress(PWR_ADDRESS, BLE_ADDR_RANDOM));
+  powerAdv.setName(PWR_NAME);
+  powerAdv.setAppearance(PWR_APPEAR);
+  powerAdv.setCompleteServices16({CPS_SERVICE_UUID});
+
+  NimBLEExtAdvertisement speedAdv;
+  speedAdv.setLegacyAdvertising(true);
+  speedAdv.setConnectable(true);
+  speedAdv.setScannable(true);
+  speedAdv.setAddress(NimBLEAddress(SPD_ADDRESS, BLE_ADDR_RANDOM));
+  speedAdv.setName(SPD_NAME);
+  speedAdv.setAppearance(SPD_APPEAR);
+  speedAdv.setCompleteServices16({CSC_SERVICE_UUID});
+
+  NimBLEExtAdvertising* pAdv = NimBLEDevice::getAdvertising();
+  if (!pAdv->setInstanceData(0, powerAdv) || !pAdv->setInstanceData(1, speedAdv)) {
+    Serial.println("[srv] FAILED to register advertising instance data");
+  }
+  if (!pAdv->start(0, 0) || !pAdv->start(1, 0)) {
+    Serial.println("[srv] FAILED to start advertising instances");
+  } else {
+    Serial.printf("[srv] advertising as %s (%s) + %s (%s)\n",
+                  PWR_NAME, PWR_ADDRESS, SPD_NAME, SPD_ADDRESS);
+  }
 
   // ---- Bike-side scan setup ----
-  // POWER ESP owns the BLE central role to the bike. SPEED ESP doesn't connect
-  // to the bike at all — it receives parsed BikeFrames via ESP-NOW relay.
-  if (IS_POWER && !SIMULATE_BIKE) {
+  if (!SIMULATE_BIKE) {
     NimBLEScan* scan = NimBLEDevice::getScan();
     scan->setScanCallbacks(&g_scanCallbacks, false);
     scan->setInterval(1349);
@@ -403,15 +345,9 @@ void setup() {
   } else {
     g_state = S_STREAMING;
   }
-
-  // ESP-NOW: POWER broadcasts BikeFrames; SPEED listens. Must come AFTER
-  // NimBLE init since both share the 2.4 GHz radio and ESP-NOW needs the
-  // WiFi PHY brought up.
-  setup_espnow();
 }
 
 void loop() {
-  // 0. Bike simulation overlay: inject constant values and keep state forced.
   if (SIMULATE_BIKE) {
     g_speed_cmps           = SIM_SPEED_CMPS;
     g_cadence_halfrpm      = SIM_CADENCE_HALFRPM;
@@ -420,7 +356,6 @@ void loop() {
     g_state                = S_STREAMING;
   }
 
-  // 1. Drain bike frames into derived state.
   BikeFrame frame;
   while (xQueueReceive(g_frameQueue, &frame, 0) == pdTRUE) {
     if (frame.has_speed)      g_speed_cmps      = frame.speed_cmps;
@@ -429,8 +364,7 @@ void loop() {
     if (g_state == S_CONNECTED) g_state = S_STREAMING;
   }
 
-  // 2-4. Bike-side state machine — POWER role only.
-  if (IS_POWER && !SIMULATE_BIKE) {
+  if (!SIMULATE_BIKE) {
     if (g_doConnect) {
       g_doConnect = false;
       if (connect_to_target()) {
@@ -475,22 +409,21 @@ void loop() {
     }
   }
 
-  // 5. Publish CPS + CSC at 1 Hz when at least one Garmin client is connected.
   uint32_t now = millis();
   if (now - g_last_publish_ms >= 1000) {
     g_last_publish_ms = now;
     static uint32_t last_logged_notifies = 0;
     uint32_t notifies = g_notify_count;
-    Serial.printf("[1Hz] state=%d notifies=%lu (+%lu) speed=%.2fkmh cad=%uRPM pwr=%dW garmin=%d\n",
+    Serial.printf("[1Hz] state=%d notifies=%lu (+%lu) speed=%.2fkmh cad=%uRPM pwr=%dW conns=%u\n",
                   (int)g_state, (unsigned long)notifies,
                   (unsigned long)(notifies - last_logged_notifies),
                   g_speed_cmps / 100.0, g_cadence_halfrpm / 2,
-                  (int)g_inst_power_w, (int)g_pServer->getConnectedCount());
+                  (int)g_inst_power_w, (unsigned)g_pServer->getConnectedCount());
     last_logged_notifies = notifies;
     if (g_pServer->getConnectedCount() > 0) {
       update_revolution_counters();
-      if (IS_POWER) publish_cps_frame();
-      else          publish_csc_frame();
+      publish_cps_frame();
+      publish_csc_frame();
     }
   }
 
