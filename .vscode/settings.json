@@ -1,9 +1,0 @@
-{
-    "files.associations": {
-        "*.old": "cpp",
-        "*.ref": "cpp",
-        "*.tcc": "cpp",
-        "numeric": "cpp",
-        "limits": "cpp"
-    }
-}

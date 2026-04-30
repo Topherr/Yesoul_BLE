@@ -1,414 +1,498 @@
-/** NimBLE_Server Demo:
- *
-This is working to broadcast Power and Cadence under the Cycling Power Service Profile
-Data tested against Edge and Phone
- * 
-*/
+// Yesoul_BLE bridge: subscribes to a Yesoul G1M Plus FTMS Indoor Bike Data
+// stream and re-broadcasts the data as a standard Cycling Power Service +
+// Cycling Speed and Cadence Service so Garmin Edge / watch can consume it.
+
 #include <Arduino.h>
 #include <NimBLEDevice.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include "ftms_parser.h"
 
-short powerInstantaneous = 0;
-short cadenceInstantaneous = 0;
-short speedInstantaneous = 0;
-float powerScale = 1.28; // incoming power is multiplied by this value for correction
-short resistance = 0; //Not currently doing anything with this value after receiving it
-bool notify = false;
+// ---- Configuration ----
+// Empirical findings (2026-04-30):
+//   1. Garmin epix 2's "Add Sensor → Speed" filter rejects devices that also
+//      expose CPS — only CSC-only peripherals are listed. So we ship two ESPs:
+//      one CPS-only (POWER), one CSC-only (SPEED).
+//   2. The Yesoul allows only one BLE central. The POWER ESP owns the bike
+//      connection; the SPEED ESP receives parsed BikeFrames via ESP-NOW relay.
+// Role is selected via build flag in platformio.ini (-DDEVICE_ROLE_POWER or
+// -DDEVICE_ROLE_SPEED). See docs/ARCHITECTURE.md and docs/JOURNEY.md.
+enum class Role { POWER, SPEED };
+#if defined(DEVICE_ROLE_POWER)
+static constexpr Role     DEVICE_ROLE              = Role::POWER;
+#elif defined(DEVICE_ROLE_SPEED)
+static constexpr Role     DEVICE_ROLE              = Role::SPEED;
+#else
+#error "Define DEVICE_ROLE_POWER or DEVICE_ROLE_SPEED via -D in platformio.ini"
+#endif
+static constexpr bool     IS_POWER                 = (DEVICE_ROLE == Role::POWER);
+static constexpr bool     IS_SPEED                 = (DEVICE_ROLE == Role::SPEED);
+static constexpr const char* DEVICE_NAME           = IS_POWER ? "Yesoul_PWR" : "Yesoul_SPD";
+static constexpr uint16_t DEVICE_APPEARANCE        = IS_POWER ? 0x0484 : 0x0482;  // 0x0484 = Cycling Power Sensor, 0x0482 = Cycling Speed Sensor
 
-// Define stuff for the Client that will receive data from Fitness Machine
-// The remote service we wish to connect to.
-static BLEUUID serviceUUID("1826"); // Fitness Machine
-// The characteristic of the remote service we are interested in.
-static BLEUUID charUUID("2ad2"); // Indoor Bike (Fitness Machine)
+// SIMULATE_BIKE: bypass bike-side scan/connect entirely and inject realistic
+// mid-ride values into the publish pipeline. Useful for verifying pairing
+// flows without pedaling. Default false → real bike.
+static constexpr bool     SIMULATE_BIKE            = false;
+static constexpr uint16_t SIM_SPEED_CMPS           = 2000;    // 20.00 km/h
+static constexpr uint16_t SIM_CADENCE_HALFRPM      = 120;     // 60 RPM
+static constexpr int16_t  SIM_INST_POWER_W         = 150;
 
-static boolean doConnect = false;
-static boolean connected = false;
-static boolean doScan = false;
-static BLERemoteCharacteristic *pRemoteCharacteristic;
-static BLEAdvertisedDevice *myDevice;
-/* 
- * Server Stuff
- */
-static NimBLEServer *pServer;
-/**  None of these are required as they will be handled by the library with defaults. **
- **                       Remove as you see fit for your needs                        */
-class ServerCallbacks : public NimBLEServerCallbacks
-{
-  void onConnect(NimBLEServer *pServer)
-  {
-    Serial.println("Client connected");
-    Serial.println("Multi-connect support: start advertising");
+static constexpr float    POWER_SCALE              = 1.28f;
+static constexpr float    WHEEL_CIRCUMFERENCE_M    = 2.000f;
+static constexpr uint32_t NOTIFICATION_WATCHDOG_MS = 5000;
+static constexpr uint32_t COOLDOWN_MS              = 1000;
+static constexpr uint32_t SCAN_BACKOFF_INITIAL_MS  = 5000;
+static constexpr uint32_t SCAN_BACKOFF_MAX_MS      = 60000;
+
+// ---- BLE UUIDs ----
+static const NimBLEUUID FTMS_SERVICE_UUID("1826");
+static const NimBLEUUID FTMS_INDOOR_BIKE_DATA_UUID("2AD2");
+
+static const NimBLEUUID CPS_SERVICE_UUID("1818");
+static const NimBLEUUID CPS_MEASUREMENT_UUID("2A63");
+static const NimBLEUUID CPS_FEATURE_UUID("2A65");
+static const NimBLEUUID CPS_SENSOR_LOCATION_UUID("2A5D");
+
+static const NimBLEUUID CSC_SERVICE_UUID("1816");
+static const NimBLEUUID CSC_MEASUREMENT_UUID("2A5B");
+static const NimBLEUUID CSC_FEATURE_UUID("2A5C");
+static const NimBLEUUID CSC_SC_CONTROL_POINT_UUID("2A55");
+
+// ---- Bike-side state machine ----
+enum BikeState {
+  S_SCANNING,
+  S_CONNECTED,
+  S_STREAMING,
+  S_DISCONNECTED,
+  S_COOLDOWN,
+};
+
+static volatile BikeState g_state                  = S_SCANNING;
+static volatile uint32_t  g_last_notification_ms   = 0;
+static volatile bool      g_doConnect              = false;
+static uint32_t           g_scan_backoff_ms        = SCAN_BACKOFF_INITIAL_MS;
+static uint32_t           g_cooldown_started_ms    = 0;
+static uint32_t           g_consecutive_failures   = 0;
+
+static NimBLEClient*           g_pClient = nullptr;
+static NimBLEAdvertisedDevice* g_pTarget = nullptr;
+
+static QueueHandle_t g_frameQueue = nullptr;
+
+// ---- Garmin-side state ----
+static NimBLEServer*         g_pServer        = nullptr;
+static NimBLECharacteristic* g_cpsMeasurement = nullptr;
+static NimBLECharacteristic* g_cscMeasurement = nullptr;
+
+static volatile uint16_t g_speed_cmps      = 0;
+static volatile uint16_t g_cadence_halfrpm = 0;
+static volatile int16_t  g_inst_power_w    = 0;
+
+// Cumulative counters persist across bike-side reconnects; reset only when the
+// last Garmin client disconnects, so the head-unit doesn't see counter resets
+// mid-ride.
+static float    g_wheel_revs_accum      = 0.0f;
+static float    g_crank_revs_accum      = 0.0f;
+static uint32_t g_cumulative_wheel_revs = 0;
+static uint16_t g_cumulative_crank_revs = 0;
+// CSC uses 1/1024 s for both wheel and crank event times.
+static uint16_t g_last_wheel_event_time_1024 = 0;
+static uint16_t g_last_crank_event_time_1024 = 0;
+static uint32_t g_last_csc_update_ms         = 0;
+static uint32_t g_last_publish_ms            = 0;
+
+// ---- Server (Garmin-facing) callbacks ----
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+    Serial.printf("[srv] client connected: %s\n", connInfo.getAddress().toString().c_str());
+    pServer->updateConnParams(connInfo.getConnHandle(), 24, 48, 0, 60);
     NimBLEDevice::startAdvertising();
-  };
-  /** Alternative onConnect() method to extract details of the connection. 
-     *  See: src/ble_gap.h for the details of the ble_gap_conn_desc struct.
-     */
-  void onConnect(NimBLEServer *pServer, ble_gap_conn_desc *desc)
-  {
-    Serial.print("Client address: ");
-    Serial.println(NimBLEAddress(desc->peer_ota_addr).toString().c_str());
-    /** We can use the connection handle here to ask for different connection parameters.
-         *  Args: connection handle, min connection interval, max connection interval
-         *  latency, supervision timeout.
-         *  Units; Min/Max Intervals: 1.25 millisecond increments.
-         *  Latency: number of intervals allowed to skip.
-         *  Timeout: 10 millisecond increments, try for 5x interval time for best results.  
-         */
-    pServer->updateConnParams(desc->conn_handle, 24, 48, 0, 60);
-  };
-  void onDisconnect(NimBLEServer *pServer)
-  {
-    Serial.println("Client disconnected - start advertising");
+  }
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+    Serial.printf("[srv] client disconnected (reason=0x%x)\n", reason);
+    if (pServer->getConnectedCount() == 0) {
+      g_wheel_revs_accum = 0;
+      g_crank_revs_accum = 0;
+      g_cumulative_wheel_revs = 0;
+      g_cumulative_crank_revs = 0;
+    }
     NimBLEDevice::startAdvertising();
-  };
-  void onMTUChange(uint16_t MTU, ble_gap_conn_desc *desc)
-  {
-    Serial.printf("MTU updated: %u for connection ID: %u\n", MTU, desc->conn_handle);
-  };
+  }
 };
 
-/** Handler class for characteristic actions */
-class CharacteristicCallbacks : public NimBLECharacteristicCallbacks
-{
-  void onRead(NimBLECharacteristic *pCharacteristic)
-  {
-    Serial.print(pCharacteristic->getUUID().toString().c_str());
-    Serial.print(": onRead(), value: ");
-    Serial.println(pCharacteristic->getValue().c_str());
-  };
-
-  void onWrite(NimBLECharacteristic *pCharacteristic)
-  {
-    Serial.print(pCharacteristic->getUUID().toString().c_str());
-    Serial.print(": onWrite(), value: ");
-    Serial.println(pCharacteristic->getValue().c_str());
-  };
-  /** Called before notification or indication is sent, 
-     *  the value can be changed here before sending if desired.
-     */
-  void onNotify(NimBLECharacteristic *pCharacteristic)
-  {
-    Serial.println("Sending notification to clients");
-  };
-
-  /** The status returned in status is defined in NimBLECharacteristic.h.
-     *  The value returned in code is the NimBLE host return code.
-     */
-  void onStatus(NimBLECharacteristic *pCharacteristic, Status status, int code)
-  {
-    String str = ("Notification/Indication status code: ");
-    str += status;
-    str += ", return code: ";
-    str += code;
-    str += ", ";
-    str += NimBLEUtils::returnCodeToString(code);
-    Serial.println(str);
-  };
-
-  void onSubscribe(NimBLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc, uint16_t subValue)
-  {
-    String str = "Client ID: ";
-    str += desc->conn_handle;
-    str += " Address: ";
-    str += std::string(NimBLEAddress(desc->peer_ota_addr)).c_str();
-    if (subValue == 0)
-    {
-      str += " Unsubscribed to ";
+// SC Control Point: ACK Set Cumulative Value (op 1) as a no-op success;
+// Op Code Not Supported for everything else. Garmin watches require this
+// characteristic to exist for the CSC sensor to be discoverable.
+class SCControlPointCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& /*connInfo*/) override {
+    NimBLEAttValue val = pCharacteristic->getValue();
+    if (val.length() == 0) return;
+    uint8_t op = val[0];
+    uint8_t resp[3] = { 0x10, op, 0x02 };  // default: Op Code Not Supported
+    if (op == 1 && val.length() >= 5) {
+      uint32_t newVal = (uint32_t)val[1] | ((uint32_t)val[2] << 8) |
+                        ((uint32_t)val[3] << 16) | ((uint32_t)val[4] << 24);
+      g_wheel_revs_accum      = (float)newVal;
+      g_cumulative_wheel_revs = newVal;
+      resp[2] = 0x01;  // Success
     }
-    else if (subValue == 1)
-    {
-      str += " Subscribed to notifications for ";
-    }
-    else if (subValue == 2)
-    {
-      str += " Subscribed to indications for ";
-    }
-    else if (subValue == 3)
-    {
-      str += " Subscribed to notifications and indications for ";
-    }
-    str += std::string(pCharacteristic->getUUID()).c_str();
-
-    Serial.println(str);
-  };
+    pCharacteristic->setValue(resp, 3);
+    pCharacteristic->indicate();
+  }
 };
 
-/** Handler class for descriptor actions */
-class DescriptorCallbacks : public NimBLEDescriptorCallbacks
-{
-  void onWrite(NimBLEDescriptor *pDescriptor)
-  {
-    std::string dscVal = pDescriptor->getValue();
-    Serial.print("Descriptor witten value:");
-    Serial.println(dscVal.c_str());
-  };
+// ---- Bike-side (client) callbacks ----
+class ClientCallbacks : public NimBLEClientCallbacks {
+  void onDisconnect(NimBLEClient* pClient, int reason) override {
+    Serial.printf("[bike] disconnected (reason=0x%x)\n", reason);
+    g_state = S_DISCONNECTED;
+  }
+} g_clientCallbacks;
 
-  void onRead(NimBLEDescriptor *pDescriptor)
-  {
-    Serial.print(pDescriptor->getUUID().toString().c_str());
-    Serial.println(" Descriptor read");
-  };
-};
-/* 
- * Client Stuff
- */
-// This callback is for when data is received from Server
-static void notifyCallback(
-    BLERemoteCharacteristic *pBLERemoteCharacteristic,
-    uint8_t *pData,
-    size_t length,
-    bool isNotify)
-{
-  powerInstantaneous = pData[11] | pData[12] << 8;       // 2 bytes of power
-  Serial.printf("Power = %d\n", powerInstantaneous);
-  powerInstantaneous = powerInstantaneous * powerScale;  //power value correction
-  cadenceInstantaneous = (pData[4] | pData[5] << 8) / 2; // 2 bytes of power in 0.5 resolution RPM, convert to RPM
-  resistance = pData[9];                                 // 1 byte of resistance
-  Serial.printf("Power = %d | Cadence = %d | Resistance = %d\n", powerInstantaneous, cadenceInstantaneous, resistance);
+class ScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* dev) override {
+    if (g_state != S_SCANNING) return;
+    // Match on FTMS service UUID alone; the Yesoul doesn't always advertise
+    // a name and the user only has one FTMS device in their environment.
+    if (!dev->haveServiceUUID() || !dev->isAdvertisingService(FTMS_SERVICE_UUID)) return;
+
+    Serial.printf("[bike] FTMS target found: '%s' @ %s\n",
+                  dev->getName().c_str(), dev->getAddress().toString().c_str());
+    NimBLEDevice::getScan()->stop();
+    delete g_pTarget;
+    g_pTarget   = new NimBLEAdvertisedDevice(*dev);
+    g_doConnect = true;
+  }
+} g_scanCallbacks;
+
+// notifyCallback runs on the BLE host task — do nothing heavy.
+static volatile uint32_t g_notify_count = 0;
+
+// ESP-NOW relay: the Yesoul allows only one BLE central, so the POWER ESP owns
+// the bike connection and broadcasts each parsed BikeFrame to the SPEED ESP
+// via ESP-NOW. Both ESPs sit on the same 2.4 GHz radio sharing time with BLE.
+static const uint8_t ESPNOW_BROADCAST_ADDR[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+static void OnEspNowRecv(const uint8_t* /*mac*/, const uint8_t* data, int len) {
+  if (len != (int)sizeof(BikeFrame)) return;
+  BikeFrame frame;
+  memcpy(&frame, data, sizeof(BikeFrame));
+  frame.millis_received = millis();
+  xQueueSend(g_frameQueue, &frame, 0);
+  g_last_notification_ms = millis();
+  g_notify_count++;
 }
 
-/**  None of these are required as they will be handled by the library with defaults. **
- **                       Remove as you see fit for your needs                        */
-class MyClientCallback : public BLEClientCallbacks
-{
-  void onConnect(BLEClient *pclient)
-  {
+static void setup_espnow() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[espnow] init FAILED");
+    return;
   }
-
-  void onDisconnect(BLEClient *pclient)
-  {
-    connected = false;
-    Serial.println("onDisconnect");
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, ESPNOW_BROADCAST_ADDR, 6);
+  peer.channel = 0;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+  if (IS_SPEED) {
+    esp_now_register_recv_cb(OnEspNowRecv);
   }
-};
+  Serial.printf("[espnow] init OK (%s)\n", IS_POWER ? "broadcasting" : "receiving");
+}
 
-bool connectToServer()
-{
-  Serial.print("Forming a connection to ");
-  Serial.println(myDevice->getAddress().toString().c_str());
+static void notifyCallback(NimBLERemoteCharacteristic* /*chr*/, uint8_t* pData,
+                           size_t len, bool /*isNotify*/) {
+  BikeFrame frame{};
+  if (parse_indoor_bike_data(pData, len, frame)) {
+    frame.millis_received = millis();
+    xQueueSend(g_frameQueue, &frame, 0);
+    if (IS_POWER) {
+      // Relay to SPEED ESP. Best-effort; we don't care if any single send drops.
+      esp_now_send(ESPNOW_BROADCAST_ADDR, (const uint8_t*)&frame, sizeof(frame));
+    }
+  }
+  g_last_notification_ms = millis();
+  g_notify_count++;
+}
 
-  BLEClient *pClient = BLEDevice::createClient();
-  Serial.println(" - Created client");
-
-  pClient->setClientCallbacks(new MyClientCallback());
-
-  // Connect to the remove BLE Server.
-  pClient->connect(myDevice); // if you pass BLEAdvertisedDevice instead of address, it will be recognized type of peer device address (public or private)
-  Serial.println(" - Connected to server");
-
-  // Obtain a reference to the service we are after in the remote BLE server.
-  BLERemoteService *pRemoteService = pClient->getService(serviceUUID);
-  if (pRemoteService == nullptr)
-  {
-    Serial.print("Failed to find our service UUID: ");
-    Serial.println(serviceUUID.toString().c_str());
-    pClient->disconnect();
+// ---- helpers ----
+static bool connect_to_target() {
+  if (!g_pTarget) return false;
+  if (g_pClient) {
+    NimBLEDevice::deleteClient(g_pClient);
+    g_pClient = nullptr;
+  }
+  g_pClient = NimBLEDevice::createClient();
+  g_pClient->setClientCallbacks(&g_clientCallbacks, false);
+  if (!g_pClient->connect(g_pTarget)) {
+    NimBLEDevice::deleteClient(g_pClient);
+    g_pClient = nullptr;
     return false;
   }
-  Serial.println(" - Found our service");
-
-  // Obtain a reference to the characteristic in the service of the remote BLE server.
-  pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
-  if (pRemoteCharacteristic == nullptr)
-  {
-    Serial.print("Failed to find our characteristic UUID: ");
-    Serial.println(charUUID.toString().c_str());
-    pClient->disconnect();
+  NimBLERemoteService* svc = g_pClient->getService(FTMS_SERVICE_UUID);
+  if (!svc) { g_pClient->disconnect(); return false; }
+  NimBLERemoteCharacteristic* chr = svc->getCharacteristic(FTMS_INDOOR_BIKE_DATA_UUID);
+  if (!chr) { g_pClient->disconnect(); return false; }
+  if (!chr->subscribe(true, notifyCallback)) {
+    g_pClient->disconnect();
     return false;
   }
-  Serial.println(" - Found our characteristic");
-
-  // Read the value of the characteristic.
-  if (pRemoteCharacteristic->canRead())
-  {
-    std::string value = pRemoteCharacteristic->readValue();
-    Serial.print("The characteristic value was: ");
-    Serial.println(value.c_str());
-  }
-
-  if (pRemoteCharacteristic->canNotify())
-    pRemoteCharacteristic->registerForNotify(notifyCallback);
-
-  connected = true;
+  g_last_notification_ms = millis();
   return true;
 }
 
-/**
- * Scan for BLE servers and find the first one that advertises the service we are looking for.
- */
-class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
-{
-  /**
-   * Called for each advertising BLE server.
-   */
+static void start_scan() {
+  Serial.printf("[bike] scanning...\n");
+  g_state = S_SCANNING;
+  NimBLEDevice::getScan()->start(0, false, true);
+}
 
-  /*** Only a reference to the advertised device is passed now
-  void onResult(BLEAdvertisedDevice advertisedDevice) { **/
-  void onResult(BLEAdvertisedDevice *advertisedDevice)
-  {
-    Serial.print("BLE Advertised Device found: ");
-    Serial.println(advertisedDevice->toString().c_str());
+static void update_revolution_counters() {
+  uint32_t now = millis();
+  if (g_last_csc_update_ms == 0) { g_last_csc_update_ms = now; return; }
+  float dt_s = (now - g_last_csc_update_ms) / 1000.0f;
+  g_last_csc_update_ms = now;
 
-    // We have found a device, let us now see if it contains the service we are looking for.
-    /********************************************************************************
-    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
-********************************************************************************/
-    if (advertisedDevice->haveServiceUUID() && advertisedDevice->isAdvertisingService(serviceUUID))
-    {
+  float speed_mps = g_speed_cmps * 0.01f / 3.6f;
+  g_wheel_revs_accum += speed_mps * dt_s / WHEEL_CIRCUMFERENCE_M;
+  uint32_t new_wheel = (uint32_t)g_wheel_revs_accum;
+  if (new_wheel > g_cumulative_wheel_revs) {
+    g_cumulative_wheel_revs = new_wheel;
+    g_last_wheel_event_time_1024 = (uint16_t)(((uint64_t)now * 1024 / 1000) & 0xffff);
+  }
 
-      BLEDevice::getScan()->stop();
-      /*******************************************************************
-      myDevice = new BLEAdvertisedDevice(advertisedDevice);
-*******************************************************************/
-      myDevice = advertisedDevice; /** Just save the reference now, no need to copy the object */
-      doConnect = true;
-      doScan = true;
-
-    } // Found our server
-  }   // onResult
-};    // MyAdvertisedDeviceCallbacks
-
-//delays for X ms, should not block execution
-void softDelay(unsigned long delayTime)
-{
-  unsigned long startTime = millis();
-  while ((millis() - startTime) < delayTime)
-  {
-    //wait
+  float crank_rps = (g_cadence_halfrpm * 0.5f) / 60.0f;
+  g_crank_revs_accum += crank_rps * dt_s;
+  uint16_t new_crank = (uint16_t)g_crank_revs_accum;
+  if (new_crank != g_cumulative_crank_revs) {
+    g_cumulative_crank_revs = new_crank;
+    g_last_crank_event_time_1024 = (uint16_t)(((uint64_t)now * 1024 / 1000) & 0xffff);
   }
 }
 
-/** Define callback instances globally to use for multiple Charateristics \ Descriptors */
-// This section is for the Server that will broadcast the data as Cycling Power
-static DescriptorCallbacks dscCallbacks;
-static CharacteristicCallbacks chrCallbacks;
-NimBLECharacteristic *CyclingPowerFeature = NULL;
-NimBLECharacteristic *CyclingPowerMeasurement = NULL;
-NimBLECharacteristic *CyclingPowerSensorLocation = NULL;
-unsigned char bleBuffer[8];
-unsigned char slBuffer[1];
-unsigned char fBuffer[4];
-unsigned short revolutions = 0;
-unsigned short timestamp = 0;
-unsigned short flags = 0x20;
-byte sensorlocation = 0x0D;
-long lastNotify = 0;
-long lastRevolution = 0;
+static void publish_cps_frame() {
+  // CPS Measurement, flags 0x0020 (crank-rev only). Garmin watches read power
+  // and cadence from CPS; speed comes from CSC. Sending wheel-rev here too
+  // triggers Garmin's documented duplicate-counting bug → 2x speed.
+  // 0-1 flags, 2-3 inst power (sint16), 4-5 crank revs (uint16),
+  // 6-7 last crank event time (uint16, 1/1024 s).
+  int16_t pwr = (int16_t)(g_inst_power_w * POWER_SCALE);
+  uint16_t flags = 0x0020;
+  uint8_t buf[8];
+  buf[0] = flags & 0xff;
+  buf[1] = (flags >> 8) & 0xff;
+  buf[2] = pwr & 0xff;
+  buf[3] = (pwr >> 8) & 0xff;
+  buf[4] = g_cumulative_crank_revs        & 0xff;
+  buf[5] = (g_cumulative_crank_revs >> 8)  & 0xff;
+  buf[6] = g_last_crank_event_time_1024        & 0xff;
+  buf[7] = (g_last_crank_event_time_1024 >> 8) & 0xff;
+  g_cpsMeasurement->setValue(buf, 8);
+  g_cpsMeasurement->notify();
+}
 
-void setup()
-{
+static void publish_csc_frame() {
+  // CSC Measurement, flags 0x01 (wheel-rev only). 7-byte frame:
+  // 0 flags, 1-4 cumulative wheel revs (uint32), 5-6 last wheel event time (uint16, 1/1024 s).
+  // Crank-rev intentionally omitted; it lives on CPS only.
+  uint8_t buf[7];
+  buf[0] = 0x01;
+  buf[1] = g_cumulative_wheel_revs        & 0xff;
+  buf[2] = (g_cumulative_wheel_revs >> 8)  & 0xff;
+  buf[3] = (g_cumulative_wheel_revs >> 16) & 0xff;
+  buf[4] = (g_cumulative_wheel_revs >> 24) & 0xff;
+  buf[5] = g_last_wheel_event_time_1024        & 0xff;
+  buf[6] = (g_last_wheel_event_time_1024 >> 8) & 0xff;
+  g_cscMeasurement->setValue(buf, 7);
+  g_cscMeasurement->notify();
+}
+
+void setup() {
   Serial.begin(115200);
-  Serial.println("Starting NimBLE Server");
+  delay(100);
+  Serial.println();
+  Serial.println("=== Yesoul_BLE bridge ===");
+  Serial.printf("Power scale: %.3f\n", (double)POWER_SCALE);
+  Serial.printf("Wheel circumference: %.3f m\n", (double)WHEEL_CIRCUMFERENCE_M);
+  if (SIMULATE_BIKE) {
+    Serial.printf("[sim] BIKE SIMULATION ENABLED — speed=%.2fkmh, cadence=%uRPM, raw_power=%dW\n",
+                  SIM_SPEED_CMPS / 100.0, SIM_CADENCE_HALFRPM / 2, (int)SIM_INST_POWER_W);
+  }
 
-  /** sets device name */
-  NimBLEDevice::init("Yesoul_CP");
-  /** Optional: set the transmit power, default is 3db */
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9); /** +9db */
+  g_frameQueue = xQueueCreate(8, sizeof(BikeFrame));
 
-  pServer = NimBLEDevice::createServer();
-  pServer->setCallbacks(new ServerCallbacks());
+  NimBLEDevice::init(DEVICE_NAME);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  // Bonding intentionally OFF. Tried bonding (setSecurityAuth(true, false, false))
+  // but stale-bond mismatch was preventing the Garmin from re-pairing after the
+  // user removed the sensor on its side. With no bond, every reconnect is a
+  // fresh pair — slightly noisier UX but reliable. Re-enable later if needed.
+  Serial.printf("[srv] %d bonds in NVS, clearing\n", NimBLEDevice::getNumBonds());
+  NimBLEDevice::deleteAllBonds();
 
-  fBuffer[0] = 0x00;
-  fBuffer[1] = 0x00;
-  fBuffer[2] = 0x00;
-  fBuffer[3] = 0x08;
+  g_pServer = NimBLEDevice::createServer();
+  g_pServer->setCallbacks(new ServerCallbacks());
 
-  slBuffer[0] = sensorlocation & 0xff;
+  uint8_t loc[1] = { 0x0D };  // Rear Hub.
 
-  NimBLEService *pDeadService = pServer->createService("1818");
-  CyclingPowerFeature = pDeadService->createCharacteristic(
-      "2A65",
-      NIMBLE_PROPERTY::READ);
-  CyclingPowerSensorLocation = pDeadService->createCharacteristic(
-      "2A5D",
-      NIMBLE_PROPERTY::READ);
-  CyclingPowerMeasurement = pDeadService->createCharacteristic(
-      "2A63",
-      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  if (IS_POWER) {
+    // ---- CPS service (this ESP plays the role of a power meter) ----
+    NimBLEService* cps = g_pServer->createService(CPS_SERVICE_UUID);
 
-  CyclingPowerFeature->setValue(fBuffer, 4);
-  CyclingPowerSensorLocation->setValue(slBuffer, 1);
-  CyclingPowerMeasurement->setValue(slBuffer, 1);
+    NimBLECharacteristic* cpsFeature = cps->createCharacteristic(CPS_FEATURE_UUID, NIMBLE_PROPERTY::READ);
+    // CPS Feature, little-endian uint32. Bit 3 = "Crank Revolution Data Supported".
+    uint8_t cpsFeatureValue[4] = { 0x08, 0x00, 0x00, 0x00 };
+    cpsFeature->setValue(cpsFeatureValue, 4);
 
-  /** Start the services when finished creating all Characteristics and Descriptors */
-  pDeadService->start();
+    NimBLECharacteristic* cpsLoc = cps->createCharacteristic(CPS_SENSOR_LOCATION_UUID, NIMBLE_PROPERTY::READ);
+    cpsLoc->setValue(loc, 1);
 
-  NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
-  /** Add the services to the advertisment data **/
-  pAdvertising->addServiceUUID(pDeadService->getUUID());
-  pAdvertising->setScanResponse(true);
-  pAdvertising->start();
+    g_cpsMeasurement = cps->createCharacteristic(CPS_MEASUREMENT_UUID,
+                                                 NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    uint8_t initCps[8] = {0};
+    g_cpsMeasurement->setValue(initCps, 8);
+  } else {
+    // ---- CSC service (this ESP plays the role of a speed sensor) ----
+    NimBLEService* csc = g_pServer->createService(CSC_SERVICE_UUID);
 
-  Serial.println("Advertising Started");
+    NimBLECharacteristic* cscFeature = csc->createCharacteristic(CSC_FEATURE_UUID, NIMBLE_PROPERTY::READ);
+    // CSC Feature, little-endian uint16. Bit 0 = "Wheel Revolution Data Supported" only.
+    uint8_t cscFeatureValue[2] = { 0x01, 0x00 };
+    cscFeature->setValue(cscFeatureValue, 2);
 
-  Serial.println("Starting Arduino BLE Client application...");
-  BLEDevice::init("");
+    NimBLECharacteristic* cscLoc = csc->createCharacteristic(CPS_SENSOR_LOCATION_UUID, NIMBLE_PROPERTY::READ);
+    cscLoc->setValue(loc, 1);
 
-  // Retrieve a Scanner and set the callback we want to use to be informed when we
-  // have detected a new device.  Specify that we want active scanning and start the
-  // scan to run for 5 seconds.
-  BLEScan *pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  pBLEScan->setInterval(1349);
-  pBLEScan->setWindow(449);
-  pBLEScan->setActiveScan(true);
-  pBLEScan->start(5, false);
+    g_cscMeasurement = csc->createCharacteristic(CSC_MEASUREMENT_UUID,
+                                                 NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    uint8_t initCsc[7] = {0};
+    g_cscMeasurement->setValue(initCsc, 7);
+
+    NimBLECharacteristic* scControlPoint = csc->createCharacteristic(
+        CSC_SC_CONTROL_POINT_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
+    scControlPoint->setCallbacks(new SCControlPointCallbacks());
+  }
+
+  // Register all services with the GATT database. Required in NimBLE 2.x —
+  // without this, services may advertise but not be discoverable on connect.
+  g_pServer->start();
+
+  // ---- Advertising ----
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(IS_POWER ? CPS_SERVICE_UUID : CSC_SERVICE_UUID);
+  adv->setAppearance(DEVICE_APPEARANCE);
+  adv->setName(DEVICE_NAME);
+  adv->enableScanResponse(false);
+  adv->start();
+  Serial.printf("[srv] advertising as %s (role=%s)\n", DEVICE_NAME, IS_POWER ? "POWER/CPS" : "SPEED/CSC");
+
+  // ---- Bike-side scan setup ----
+  // POWER ESP owns the BLE central role to the bike. SPEED ESP doesn't connect
+  // to the bike at all — it receives parsed BikeFrames via ESP-NOW relay.
+  if (IS_POWER && !SIMULATE_BIKE) {
+    NimBLEScan* scan = NimBLEDevice::getScan();
+    scan->setScanCallbacks(&g_scanCallbacks, false);
+    scan->setInterval(1349);
+    scan->setWindow(449);
+    scan->setActiveScan(true);
+    start_scan();
+  } else {
+    g_state = S_STREAMING;
+  }
+
+  // ESP-NOW: POWER broadcasts BikeFrames; SPEED listens. Must come AFTER
+  // NimBLE init since both share the 2.4 GHz radio and ESP-NOW needs the
+  // WiFi PHY brought up.
+  setup_espnow();
 }
 
-void loop()
-{
-  // If the flag "doConnect" is true then we have scanned for and found the desired
-  // BLE Server with which we wish to connect.  Now we connect to it.  Once we are
-  // connected we set the connected flag to be true.
-  if (doConnect == true)
-  {
-    if (connectToServer())
-    {
-      Serial.println("We are now connected to the BLE Server.");
-    }
-    else
-    {
-      Serial.println("We have failed to connect to the server; there is nothin more we will do.");
-    }
-    doConnect = false;
-  }
-  // If we are connected to a peer BLE Server, update the characteristic each time we are reached
-  // with the current time since boot.
-  if (connected)
-  {
-    //Stuff to do when connected to Client
-  }
-  else if (doScan)
-  {
-    BLEDevice::getScan()->start(0); // this is just sample to start scan after disconnect, most likely there is better way to do it in arduino
+void loop() {
+  // 0. Bike simulation overlay: inject constant values and keep state forced.
+  if (SIMULATE_BIKE) {
+    g_speed_cmps           = SIM_SPEED_CMPS;
+    g_cadence_halfrpm      = SIM_CADENCE_HALFRPM;
+    g_inst_power_w         = SIM_INST_POWER_W;
+    g_last_notification_ms = millis();
+    g_state                = S_STREAMING;
   }
 
-  // convert RPM to timestamp
-  if (cadenceInstantaneous != 0 && (millis()) >= (lastRevolution + (60000 / cadenceInstantaneous)))
-  {
-    revolutions++;                                  // One crank revolution should have passed, add one revolution
-    timestamp = (unsigned short)(((millis() * 1024) / 1000) % 65536); // create timestamp and format
-    lastRevolution = millis();
+  // 1. Drain bike frames into derived state.
+  BikeFrame frame;
+  while (xQueueReceive(g_frameQueue, &frame, 0) == pdTRUE) {
+    if (frame.has_speed)      g_speed_cmps      = frame.speed_cmps;
+    if (frame.has_cadence)    g_cadence_halfrpm = frame.cadence_halfrpm;
+    if (frame.has_inst_power) g_inst_power_w    = frame.inst_power_w;
+    if (g_state == S_CONNECTED) g_state = S_STREAMING;
   }
 
-  if (millis() - lastNotify >= 1000) // do this every second
-  {
-    if (pServer->getConnectedCount() > 0)
-    {
-      bleBuffer[0] = flags & 0xff;
-      bleBuffer[1] = (flags >> 8) & 0xff;
-      bleBuffer[2] = powerInstantaneous & 0xff;
-      bleBuffer[3] = (powerInstantaneous >> 8) & 0xff;
-      bleBuffer[4] = revolutions & 0xff;
-      bleBuffer[5] = (revolutions >> 8) & 0xff;
-      bleBuffer[6] = timestamp & 0xff;
-      bleBuffer[7] = (timestamp >> 8) & 0xff;
-      CyclingPowerMeasurement->setValue(bleBuffer, 8);
-      CyclingPowerMeasurement->notify();
-      lastNotify = millis();
+  // 2-4. Bike-side state machine — POWER role only.
+  if (IS_POWER && !SIMULATE_BIKE) {
+    if (g_doConnect) {
+      g_doConnect = false;
+      if (connect_to_target()) {
+        Serial.println("[bike] connected, subscribed to FTMS Indoor Bike Data");
+        g_state = S_CONNECTED;
+        g_consecutive_failures = 0;
+      } else {
+        Serial.println("[bike] connect failed");
+        g_consecutive_failures++;
+        uint32_t shift = g_consecutive_failures > 4 ? 4 : g_consecutive_failures - 1;
+        uint32_t b = SCAN_BACKOFF_INITIAL_MS << shift;
+        g_scan_backoff_ms = b > SCAN_BACKOFF_MAX_MS ? SCAN_BACKOFF_MAX_MS : b;
+        g_state = S_COOLDOWN;
+        g_cooldown_started_ms = millis();
+      }
+    }
+
+    if (g_state == S_STREAMING &&
+        (millis() - g_last_notification_ms) > NOTIFICATION_WATCHDOG_MS) {
+      Serial.println("[bike] watchdog: no notifications for 5 s");
+      g_state = S_DISCONNECTED;
+    }
+
+    if (g_state == S_DISCONNECTED) {
+      Serial.println("[bike] cleaning up client");
+      if (g_pClient) {
+        if (g_pClient->isConnected()) g_pClient->disconnect();
+        NimBLEDevice::deleteClient(g_pClient);
+        g_pClient = nullptr;
+      }
+      g_speed_cmps      = 0;
+      g_cadence_halfrpm = 0;
+      g_inst_power_w    = 0;
+      g_state = S_COOLDOWN;
+      g_cooldown_started_ms = millis();
+    }
+    if (g_state == S_COOLDOWN) {
+      uint32_t wait = g_consecutive_failures > 0 ? g_scan_backoff_ms : COOLDOWN_MS;
+      if (millis() - g_cooldown_started_ms >= wait) {
+        start_scan();
+      }
     }
   }
-  if (pServer->getConnectedCount() == 0)
-  {
-    powerInstantaneous = 0;
+
+  // 5. Publish CPS + CSC at 1 Hz when at least one Garmin client is connected.
+  uint32_t now = millis();
+  if (now - g_last_publish_ms >= 1000) {
+    g_last_publish_ms = now;
+    static uint32_t last_logged_notifies = 0;
+    uint32_t notifies = g_notify_count;
+    Serial.printf("[1Hz] state=%d notifies=%lu (+%lu) speed=%.2fkmh cad=%uRPM pwr=%dW garmin=%d\n",
+                  (int)g_state, (unsigned long)notifies,
+                  (unsigned long)(notifies - last_logged_notifies),
+                  g_speed_cmps / 100.0, g_cadence_halfrpm / 2,
+                  (int)g_inst_power_w, (int)g_pServer->getConnectedCount());
+    last_logged_notifies = notifies;
+    if (g_pServer->getConnectedCount() > 0) {
+      update_revolution_counters();
+      if (IS_POWER) publish_cps_frame();
+      else          publish_csc_frame();
+    }
   }
+
+  delay(10);
 }
