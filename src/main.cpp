@@ -248,7 +248,10 @@ static void publish_csc_frame() {
 
 void setup() {
   Serial.begin(115200);
-  delay(100);
+  // C6's only serial path is USB-Serial/JTAG (no UART bridge chip), so the
+  // host needs ~1-2 s to enumerate the CDC interface after reset. Without
+  // this delay the boot banner is swallowed every time.
+  delay(2000);
   Serial.println();
   Serial.println("=== Yesoul_BLE single-ESP experiment ===");
   Serial.printf("Power scale: %.3f, wheel: %.3f m\n",
@@ -261,7 +264,9 @@ void setup() {
   g_frameQueue = xQueueCreate(8, sizeof(BikeFrame));
 
   NimBLEDevice::init("Yesoul");
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  // NimBLE 2.x setPower takes dBm directly. +9 dBm matches what ESP_PWR_LVL_P9
+  // resolved to under the legacy enum API used on master.
+  NimBLEDevice::setPower(9);
   Serial.printf("[srv] %d bonds in NVS, clearing\n", NimBLEDevice::getNumBonds());
   NimBLEDevice::deleteAllBonds();
 
@@ -324,11 +329,20 @@ void setup() {
   speedAdv.setCompleteServices16({CSC_SERVICE_UUID});
 
   NimBLEExtAdvertising* pAdv = NimBLEDevice::getAdvertising();
-  if (!pAdv->setInstanceData(0, powerAdv) || !pAdv->setInstanceData(1, speedAdv)) {
-    Serial.println("[srv] FAILED to register advertising instance data");
+  // Use intermediate booleans so both calls always run regardless of return
+  // values — short-circuit `||` would skip the second instance if the first
+  // failed, leaving the bug invisible.
+  bool data0_ok = pAdv->setInstanceData(0, powerAdv);
+  bool data1_ok = pAdv->setInstanceData(1, speedAdv);
+  if (!data0_ok || !data1_ok) {
+    Serial.printf("[srv] FAILED to register advertising data (pwr=%d, spd=%d)\n",
+                  data0_ok, data1_ok);
   }
-  if (!pAdv->start(0, 0) || !pAdv->start(1, 0)) {
-    Serial.println("[srv] FAILED to start advertising instances");
+  bool start0_ok = pAdv->start(0, 0);
+  bool start1_ok = pAdv->start(1, 0);
+  if (!start0_ok || !start1_ok) {
+    Serial.printf("[srv] FAILED to start advertising (pwr=%d, spd=%d)\n",
+                  start0_ok, start1_ok);
   } else {
     Serial.printf("[srv] advertising as %s (%s) + %s (%s)\n",
                   PWR_NAME, PWR_ADDRESS, SPD_NAME, SPD_ADDRESS);
