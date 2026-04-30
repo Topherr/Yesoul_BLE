@@ -49,3 +49,6 @@ Logs/
 
 # Ad-hoc test binary left at repo root (root-anchored so it doesn't catch test/test_parser/)
 /test_parser
+
+# Personal pick-up notes (not for public)
+/NEXT.md
