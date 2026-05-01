@@ -60,6 +60,22 @@ bike → POWER ESP (FTMS BLE) → CPS BLE → watch
 
 Power, cadence, speed, and distance all display on the watch and record into the Bike Indoor activity.
 
+### 8. Add a TRAINER ESP for Zwift / TrainerRoad / etc.
+
+The Garmin watch was always the primary target, but the bike's data is just as relevant for indoor cycling apps. They want a smart trainer over **FTMS** — same protocol the Yesoul speaks natively to us, repackaged.
+
+The dual-ESP architecture extends cleanly: a third ESP listens on the same ESP-NOW broadcast, receives every parsed `BikeFrame`, and re-emits FTMS Indoor Bike Data (0x2AD2) to the app with all eight fields (speed, cadence, distance, resistance, instantaneous power, average power, energy, elapsed time) — flags `0x09F4`, identical to what the Yesoul itself sends to us. We also expose Fitness Machine Control Point (0x2AD9) with a no-op handler that ACKs Request Control / Reset and returns `Op Code Not Supported` for everything else; that's the contract Zwift uses to bucket the device as "controllable".
+
+The Yesoul has a manual resistance knob, so simulated-gradient commands from the app can't physically change the bike. We pretend they did (ACK them) without acting; the rider turns the knob themselves. Functionally it's a "headless smart trainer" — fully recognised, but resistance is operator-driven.
+
+```
+bike → POWER ESP (FTMS BLE) → CPS BLE → watch
+                            → ESP-NOW → SPEED ESP   → CSC BLE  → watch
+                            → ESP-NOW → TRAINER ESP → FTMS BLE → Zwift / TR / etc.
+```
+
+Net result: one bike, three ESPs, two consumers (watch + indoor app) running simultaneously off the same ride.
+
 ## What I didn't try
 
 - **Single ESP with multi-advertising.** ESP32 supports BLE 5.0 Extended Advertising with multiple advertising sets, each capable of its own random-static address. With careful setup (`NimBLEDevice::setOwnAddrType`, separate advertisement instances, role-gated GATT subset per peer connection), one chip could project two distinct virtual devices to the watch. Theoretically clean. **I had two ESPs in a drawer and gave up trying to make one work.** Worth attempting if you only have one ESP — you'd need to verify that NimBLE 2.x can serve different GATT subsets per advertising-set address, which is the part I'm not sure about.
