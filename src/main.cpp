@@ -29,8 +29,12 @@ static constexpr uint32_t SCAN_BACKOFF_MAX_MS      = 60000;
 
 // Two distinct random-static addresses. Top two bits of byte 0 must be 11
 // (i.e. byte 0 in 0xC0..0xFF) for a valid random-static identity address.
-static constexpr const char* PWR_ADDRESS  = "F1:0A:5E:00:00:01";
-static constexpr const char* SPD_ADDRESS  = "F1:0A:5E:00:00:02";
+// Addresses are deliberately divergent across all six bytes — early
+// experiments with addresses sharing an OUI hinted that the Garmin epix 2
+// might dedupe two connections "from the same vendor" down to one. Different
+// vendor bytes side-step that heuristic if it exists.
+static constexpr const char* PWR_ADDRESS  = "C1:11:22:33:44:55";
+static constexpr const char* SPD_ADDRESS  = "E2:66:77:88:99:AA";
 static constexpr const char* PWR_NAME     = "Yesoul_PWR";
 static constexpr const char* SPD_NAME     = "Yesoul_SPD";
 static constexpr uint16_t    PWR_APPEAR   = 0x0484;  // Cycling Power Sensor
@@ -91,6 +95,23 @@ static uint32_t g_last_publish_ms       = 0;
 static volatile uint32_t g_notify_count = 0;
 
 // ---- Server callbacks ----
+//
+// Extended-advertising quirk: when a peripheral has multiple advertising
+// instances and a peer connects to instance N, that instance automatically
+// stops advertising (BLE 5.0 spec behaviour). Other instances are unaffected
+// in principle — but in practice the watch only completes one of the two
+// connections it wants, then later re-connects, and by the time it tries
+// the second address the corresponding instance is no longer broadcasting.
+//
+// Fix: re-start BOTH instances on every connect and every disconnect. Calling
+// start() on an already-started instance is a no-op; calling on a stopped one
+// brings it back up. Idempotent and cheap.
+static void resume_both_advertising_instances() {
+  NimBLEExtAdvertising* pAdv = NimBLEDevice::getAdvertising();
+  pAdv->start(0, 0);
+  pAdv->start(1, 0);
+}
+
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     Serial.printf("[srv] client connected: %s (handle=%u, total=%u)\n",
@@ -98,6 +119,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
                   connInfo.getConnHandle(),
                   pServer->getConnectedCount());
     pServer->updateConnParams(connInfo.getConnHandle(), 24, 48, 0, 60);
+    resume_both_advertising_instances();
   }
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
     Serial.printf("[srv] client disconnected (reason=0x%x, remaining=%u)\n",
@@ -108,6 +130,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
       g_cumulative_wheel_revs = 0;
       g_cumulative_crank_revs = 0;
     }
+    resume_both_advertising_instances();
   }
 };
 

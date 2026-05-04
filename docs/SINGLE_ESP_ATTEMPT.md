@@ -1,6 +1,40 @@
-# Single-ESP attempt — pending hardware (XIAO ESP32-C6)
+# Single-ESP attempt — tested on XIAO ESP32-C6, **blocked at the Garmin watch** (2026-05-01)
 
-**Status:** Code is ready. Awaiting hardware delivery (Seeed XIAO ESP32-C6) for the bench test that answers the only remaining open question — whether the Garmin epix 2 trips on a shared GATT containing both CPS and CSC after pairing each via a single-UUID advertisement instance.
+**Status: dead end for the Garmin watch use case. Works fine on iPhone Zwift.** The single-ESP path is not a drop-in replacement for `master`'s dual-WROOM-32 architecture; keep dual-ESP for Garmin watch use, use this build (or a single-service variant) for iPhone / Zwift / TrainerRoad / etc.
+
+## TL;DR of the test outcome
+
+- ✅ Code compiles and flashes cleanly on XIAO ESP32-C6 with pioarduino + Arduino-ESP32 3.3.8 + NimBLE-Arduino 2.5.0.
+- ✅ Both BLE 5.0 extended-advertising instances are visible to scanners as two separate devices with distinct random-static addresses.
+- ✅ Both pair successfully on a Garmin epix 2 — Yesoul_PWR under "Add Sensor → Power", Yesoul_SPD under "Add Sensor → Speed".
+- ✅ **iPhone running Zwift** holds **two simultaneous BLE connections** to the C6 (`conns=2` confirmed via serial), reads CPS power+cadence and CSC speed concurrently. No issues.
+- ❌ **Garmin epix 2** in an active Bike Indoor session holds only **one** BLE connection at a time (`conns=1`). Power streams OR speed streams, never both — even though both are paired.
+- ❌ Tried structurally distinct random-static addresses (no shared OUI / no shared bytes): no change.
+- ❌ Tried the advertising-restart-on-connect/disconnect fix: no change for the watch (helped iPhone hold both, but watch still caps at one).
+
+## Why the watch is fundamentally blocked
+
+Garmin's watch firmware treats one physical peripheral as one sensor slot, regardless of how many BLE addresses it advertises. Convergent evidence:
+
+- **PeloMon issue #1** documents the same exact symptom on a Fenix5: <https://github.com/ihaque/pelomon/issues/1>. PeloMon advertises one BLE peripheral with both CPS and CSC, gets the same one-active-connection-at-a-time behavior. Never fixed.
+- **Garmin Connect IQ docs explicitly state**: "Connect IQ apps cannot support multiple simultaneous device connections, so you can connect to any CSC or CPS capable sensor, but only one device at a time." (<https://forums.garmin.com/developer/connect-iq/f/discussion/282112/ble-notification-not-appearing-for-ftms-ble>) The central-side stack is single-active-connection-per-device, where "device" is keyed at a layer above BLE addresses.
+- **Garmin's own dual-protocol sensors** (Vector 3, HRM-Dual, Speed/Cadence Gen 3) are explicitly the special case that *does* support two concurrent BLE connections — and that's described as a property of those *sensors*, not of the watch. Generic peripherals don't get that treatment.
+- **`master`'s dual-WROOM-32 build works precisely because Garmin sees two physically distinct radios** with two distinct GAP roles + GATT databases. The address randomness is not the discriminator.
+- **NimBLE 2.x has no per-advertising-set GATT subset**: `ble_gatts_svc_set_visibility` is global. Forking mynewt-nimble to add per-conn service visibility is a rewrite, not a fix.
+
+The iPhone Zwift evidence proves the C6 hardware and our code are fine. **It's a Garmin firmware policy choice, not a code or hardware bug.** Chasing it further is wasted effort.
+
+## What this branch leaves you with
+
+A working iPhone-Zwift-style "headless smart sensor" that exposes CPS + CSC simultaneously over multi-advertising on a single chip. Useful if you ever want to ride with Zwift on iPhone without the watch involved, or for any non-Garmin-watch BLE consumer that handles multiple connections to one peripheral cleanly. Not useful for the Garmin epix 2 watch use case.
+
+## What replaces it for the Garmin watch
+
+`master`'s dual-WROOM-32 + ESP-NOW relay. Already shipped, already working.
+
+## What to do with the C6 in hand
+
+Best repurposing: flash the C6 with `feature/ftms-trainer`'s `[env:trainer]` build. The FTMS smart-trainer role only needs one advertised service (no multi-instance ext-adv required), so it works on any ESP32 family chip — and the C6's on-board antenna, USB-C, and small form factor are nicer for an "always-on Zwift trainer" device than the WROOM-32. See `feature/ftms-trainer`'s docs.
 
 ## Why this branch exists
 
