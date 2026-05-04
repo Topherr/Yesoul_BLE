@@ -76,21 +76,56 @@ bike → POWER ESP (FTMS BLE) → CPS BLE → watch
 
 Net result: one bike, three ESPs, two consumers (watch + indoor app) running simultaneously off the same ride.
 
+### 9. Try the single-ESP path on a BLE-5.0 chip — Seeed XIAO ESP32-C6
+
+After getting Option C working on three WROOM-32s, the obvious follow-up: can a single ESP32 with BLE 5.0 extended advertising replace the dual-WROOM-32 architecture for the Garmin watch use case? Two advertising instances at distinct random-static addresses, one shared GATT, watch sees them as two devices.
+
+Bought a Seeed XIAO ESP32-C6, set up the [`single-esp-experiment`](https://github.com/Topherr/Yesoul_BLE/tree/single-esp-experiment) branch, flashed it. Verified with nRF Connect on iPhone that both BLE addresses are advertised, both pair, and **iPhone Zwift holds two simultaneous connections to the chip without trouble** (`conns=2` confirmed on serial). So the firmware and chip are fine.
+
+**The Garmin epix 2 only ever holds one connection at a time to the chip**, regardless of:
+- distinct random-static addresses (tried `F1:0A:5E:00:00:01`/`02` initially, then completely independent OUIs `C1:11:22:33:44:55` and `E2:66:77:88:99:AA`)
+- advertising-restart on disconnect
+- Both pair successfully — so it's not a discovery bug. It's a connection-manager limit.
+
+This matches [PeloMon issue #1](https://github.com/ihaque/pelomon/issues/1) on a Fenix 5 from 2021 — same architecture, same symptom, same conclusion. Garmin's [Connect IQ docs explicitly state](https://forums.garmin.com/developer/connect-iq/f/discussion/282112/ble-notification-not-appearing-for-ftms-ble) "Connect IQ apps cannot support multiple simultaneous device connections" for CSC/CPS — the watch firmware is single-active-connection-per-paired-peripheral, where "peripheral" is keyed at a level above BLE addresses. Garmin's own dual-protocol sensors (Vector 3, HRM-Dual, Speed/Cadence Gen 3) are the explicit special case.
+
+**Verdict:** single-ESP-on-Garmin-watch is fundamentally blocked by Garmin firmware policy. Not a code or hardware bug. Documented in [`docs/SINGLE_ESP_ATTEMPT.md`](SINGLE_ESP_ATTEMPT.md) and the branch is preserved as a public dead-end record.
+
+### 10. Repurpose the C6 as the standalone Zwift trainer
+
+If the C6 can't replace dual-WROOM-32 for the watch, what *can* it do? Turns out: **everything** for the Zwift use case in a single board. Flash the `trainer_c6` env, and the C6:
+
+- Connects to the bike directly as BLE central (the TRAINER role's bike-side scan is enabled when not running alongside a POWER ESP)
+- Parses FTMS Indoor Bike Data
+- Re-emits as FTMS smart trainer to Zwift / TR / etc. with `POWER_SCALE` applied to the inst-power field
+- Implements Fitness Machine Control Point with a no-op handler that ACKs Zwift's documented start sequence (Request Control → Reset → Start → Set Indoor Bike Simulation), so the trainer is recognised as "controllable" even though we can't act on the commands
+
+Tested with iPhone Zwift on 2026-05-01. All four metrics (power, cadence, speed, distance) plus resistance flow live, no dropouts.
+
+If the C6 is plugged in alongside the dual-WROOM-32 watch setup, the bike's one-central limit kicks in: POWER scans first, wins the bike, and the C6's bike-side scan fails to connect → falls back automatically to receiving over ESP-NOW (the recv callback is registered for any role that isn't POWER). All three deployment options now work from one source tree.
+
 ## What I didn't try
 
-- **Single ESP with multi-advertising.** ESP32 supports BLE 5.0 Extended Advertising with multiple advertising sets, each capable of its own random-static address. With careful setup (`NimBLEDevice::setOwnAddrType`, separate advertisement instances, role-gated GATT subset per peer connection), one chip could project two distinct virtual devices to the watch. Theoretically clean. **I had two ESPs in a drawer and gave up trying to make one work.** Worth attempting if you only have one ESP — you'd need to verify that NimBLE 2.x can serve different GATT subsets per advertising-set address, which is the part I'm not sure about.
-- **Random-static BLE address.** Some Garmin firmware reportedly prefers random-static over public for fitness sensors. With the dual-ESP architecture, public addresses worked fine; never had to test this.
-- **Battery / Device Information services.** Real CSC sensors expose them. We don't, and the watch enumerates fine without.
-- **Connect IQ data field.** Could install [FTMS All Sync](https://absolutebollockscreations.com/apps/ftmsall/) on the watch and consume FTMS directly from the bike, no bridge at all. Different deployment model, different tradeoffs (CIQ data fields write to custom screens, not native activity-record fields). Out of scope for this fork.
+- **Per-connection GATT subset on a single chip.** The single-ESP path could theoretically work if NimBLE supported showing CPS to one address's connections and CSC to the other's — Garmin's connection-manager policy might be sidestepped if each address looked like a structurally distinct device end-to-end. NimBLE 2.x's `ble_gatts_svc_set_visibility` is global, not per-connection. Forking mynewt-nimble to add per-connection visibility is a rewrite, not a tweak. Probably not worth the effort given the dual-WROOM-32 path works.
+- **Servo-on-resistance-knob.** Closing the loop on Zwift's "smart trainer" gradient/target-power commands by physically rotating the bike's manual resistance knob with a small servo. Conceptually doable in ~30 LOC + ~$15 hardware. Out of scope for the current fork; would belong in a sibling project.
+- **Battery / Device Information services.** Real BLE sensors expose them. We don't, and Garmin / Zwift / iPhone all enumerate fine without.
+- **Connect IQ data field.** [FTMS All Sync](https://absolutebollockscreations.com/apps/ftmsall/) and similar can read the bike's FTMS directly from a Garmin watch with no bridge ESP at all — but only into custom Connect IQ data fields, not the watch's native activity-record fields. Different deployment model. Out of scope.
 
 ## Useful tooling
 
 - **[nRF Connect](https://www.nordicsemi.com/Products/Development-tools/nRF-Connect-for-Mobile)** on iPhone — invaluable for confirming what GATT structure the peripheral actually exposes vs. what we think we're publishing. Should be the *first* tool reached for during BLE pairing debugging, not the last.
-- **`pio device monitor`** with `python3 + pyserial` for capturing — much cleaner than the bundled monitor when running headless. The capture script in [`docs/captures/`](captures/) is just `pyserial.read_until(b'\n')` in a loop.
+- **`python3 + pyserial`** for serial capture, much cleaner than the bundled `pio device monitor` when running headless. The capture script in [`docs/captures/`](captures/) is just `pyserial.read_until(b'\n')` in a loop.
+- **Subagent reviewers** — most of the architectural decisions in this fork were stress-tested by independent code-review and protocol-spec agents before commit. If you're iterating on something subtle (the watch single-peripheral limit, the FTMS Control Point op-code requirements for Zwift, the wheel-event-time units between CPS and CSC), getting a second opinion that hasn't seen your existing reasoning is genuinely valuable.
 
 ## Heritage and inheritance
 
-The 1.28 power-scale calibration constant in `src/main.cpp` is empirical work inherited from the upstream project — they measured the Yesoul against a reference power meter and that ratio gets close. Untouched here.
+The **1.28 power-scale calibration constant** is the upstream's. Looking at the original commit (`414aad8 Scaling for Power`, Feb 2022) the entire diff was the constant plus a one-line comment "incoming power is multiplied by this value for correction" — no methodology documentation in the repo. We've shipped `1.0` (raw watts) by default in this fork because there's no reason to trust 1.28 specifically over 1.0 for a bike model the upstream didn't test (they had a Yesoul S3; we tested with G1M Plus). If you have a calibrated reference power meter, derive your own scale and PR it back.
+
+The **NimBLE callback class structure** (`ServerCallbacks`, `CharacteristicCallbacks`, `MyClientCallback`, `MyAdvertisedDeviceCallbacks`) — these were lifted from the NimBLE-Arduino example boilerplate but the upstream's framing of which callbacks to actually use, and how to structure the `connect → discover → subscribe` flow, was a clean template. Everything in this fork's bike-side state machine is descended from that.
+
+The **CPS frame layout** (flags `0x0020`, crank-rev only, 8 bytes) is theirs verbatim. We added CSC and FTMS service emission on top.
+
+Everything else (parser library, dual-ESP architecture, ESP-NOW relay, state machine, NimBLE 2.x port, host-side tests, multi-deployment-option build envs, single-ESP experiment, all docs) is rewritten from scratch.
 
 Everything else (parser, dual-ESP architecture, ESP-NOW relay, state machine, NimBLE 2.x port, host-side test harness, docs) is rewritten from scratch.
 

@@ -60,7 +60,7 @@ static constexpr uint16_t SIM_SPEED_CMPS           = 2000;    // 20.00 km/h
 static constexpr uint16_t SIM_CADENCE_HALFRPM      = 120;     // 60 RPM
 static constexpr int16_t  SIM_INST_POWER_W         = 150;
 
-static constexpr float    POWER_SCALE              = 1.28f;
+static constexpr float    POWER_SCALE              = 1.00f;  // 1.28 = upstream-inherited calibration vs. a reference power meter; 1.00 = trust the bike's raw watts
 static constexpr float    WHEEL_CIRCUMFERENCE_M    = 2.000f;
 static constexpr uint32_t NOTIFICATION_WATCHDOG_MS = 5000;
 static constexpr uint32_t COOLDOWN_MS              = 1000;
@@ -436,7 +436,11 @@ static void publish_ftms_frame() {
 
 void setup() {
   Serial.begin(115200);
-  delay(100);
+  // 100 ms is enough on WROOM-32 (CH340 USB-UART), but the XIAO ESP32-C6
+  // uses native USB-Serial/JTAG which needs ~1-2 s for the host to enumerate
+  // the CDC interface after reset — without this delay, the boot banner is
+  // eaten when monitoring on the C6. Harmless 1.9 s extra wait on WROOM-32.
+  delay(2000);
   Serial.println();
   Serial.println("=== Yesoul_BLE bridge ===");
   Serial.printf("Power scale: %.3f\n", (double)POWER_SCALE);
@@ -547,9 +551,17 @@ void setup() {
   Serial.printf("[srv] advertising as %s (role=%s)\n", DEVICE_NAME, role_label);
 
   // ---- Bike-side scan setup ----
-  // POWER ESP owns the BLE central role to the bike. SPEED ESP doesn't connect
-  // to the bike at all — it receives parsed BikeFrames via ESP-NOW relay.
-  if (IS_POWER && !SIMULATE_BIKE) {
+  // POWER and TRAINER both run as BLE central to the bike directly:
+  //   - POWER  → uses the bike data to publish CPS to a Garmin watch, and
+  //              broadcasts each BikeFrame over ESP-NOW for the SPEED ESP.
+  //   - TRAINER → uses the bike data to publish FTMS to Zwift / TR / etc.
+  //              When deployed alongside POWER (dual-WROOM-32 + C6 setup), the
+  //              bike's one-central limit means whichever ESP boots first
+  //              wins; the loser falls back to receiving via ESP-NOW (the
+  //              ESP-NOW receive callback is registered for both SPEED and
+  //              TRAINER, so this works either way).
+  //   - SPEED  → never talks to the bike; ESP-NOW receiver only.
+  if ((IS_POWER || IS_TRAINER) && !SIMULATE_BIKE) {
     NimBLEScan* scan = NimBLEDevice::getScan();
     scan->setScanCallbacks(&g_scanCallbacks, false);
     scan->setInterval(1349);
@@ -593,8 +605,8 @@ void loop() {
     if (g_state == S_CONNECTED) g_state = S_STREAMING;
   }
 
-  // 2-4. Bike-side state machine — POWER role only.
-  if (IS_POWER && !SIMULATE_BIKE) {
+  // 2-4. Bike-side state machine — POWER and standalone TRAINER both run it.
+  if ((IS_POWER || IS_TRAINER) && !SIMULATE_BIKE) {
     if (g_doConnect) {
       g_doConnect = false;
       if (connect_to_target()) {

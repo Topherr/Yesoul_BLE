@@ -1,90 +1,120 @@
 # Yesoul_BLE
 
-Bridge a **Yesoul G1M Plus** indoor spin bike to:
-- a **Garmin epix 2 watch** (and probably any modern Fenix-class watch) — power, cadence, speed, and distance into a Bike Indoor activity natively.
-- **Zwift / TrainerRoad / Wahoo SYSTM / MyWhoosh / Rouvy** — full smart-trainer payload (power, cadence, speed, distance, resistance, energy, elapsed time) over FTMS.
+Bridge a **Yesoul indoor spin bike** to:
 
-No Connect IQ apps or third-party companions.
+- **Garmin watches and Edges** (`epix 2`, `Fenix 7`/`8`, etc.) — power, cadence, speed, distance into a Bike Indoor activity natively.
+- **Zwift / TrainerRoad / Wahoo SYSTM / MyWhoosh / Rouvy** — full smart-trainer payload (power, cadence, speed, distance, **resistance**, energy, elapsed time) over FTMS.
 
-Fork of [Raelx/Yesoul_BLE](https://github.com/Raelx/Yesoul_BLE) by Raelx and Jeremy Mikesell — single-ESP CPS-only bridge. The 1.28 power-scale constant is inherited from their empirical calibration; the rest of this fork is rewritten against NimBLE 2.x.
+No Connect IQ apps, no third-party companions, no cloud.
 
-## Architecture
+## Origins
+
+This is a heavily-extended fork of [**Raelx/Yesoul_BLE**](https://github.com/Raelx/Yesoul_BLE) by **Raelx** and **Jeremy Mikesell**, who built the original single-ESP CPS-only bridge. Their work — including the empirical 1.28 power-scale calibration constant, the FTMS-Indoor-Bike-Data-to-CPS translation pattern, and the NimBLE setup — is the foundation everything here is built on. This fork retains their power calibration, NimBLE callback structure, and ethos; everything else is rewritten against NimBLE 2.x with several years of empirical testing baked in.
+
+The first commits in this repo's history are theirs (`414aad8 Scaling for Power`, `04a3975 Working power and cadence`, etc.). If this fork is useful to you, please ★ the [upstream repo](https://github.com/Raelx/Yesoul_BLE) too.
+
+## What this fork adds
+
+- **Speed and distance** delivered to Garmin watches via a separate Cycling Speed and Cadence Service (CSC) on a second ESP — required because the Yesoul allows only one BLE central, and Garmin Fenix-class firmware filters out devices exposing CPS+CSC together.
+- **Smart-trainer support** for Zwift / TrainerRoad / etc. via Fitness Machine Service (FTMS) on a third ESP (or the same chip in standalone mode).
+- **ESP-NOW relay** between ESPs so the bike's one-central limit doesn't matter — the master ESP broadcasts parsed bike frames to siblings.
+- **Spec-driven FTMS parser** with a host-side replay test against captured ground-truth frames.
+- **Complete rewrite** against NimBLE-Arduino 2.x with explicit state machine, watchdog, scan backoff, and clean reconnect handling.
+- **Multiple deployment topologies** (below) — pick whichever matches what you have and what you ride with.
+
+## Deployment options
 
 ```mermaid
-flowchart LR
-    bike["Yesoul G1M Plus<br/>indoor bike"]
-    espA["ESP-A<br/><b>Yesoul_PWR</b>"]
-    espB["ESP-B<br/><b>Yesoul_SPD</b>"]
-    espC["ESP-C<br/><b>Yesoul_FTMS</b>"]
-    watch["Garmin epix 2<br/>watch"]
-    zwift["Zwift / TrainerRoad /<br/>Wahoo SYSTM, etc."]
-
-    bike -->|"FTMS BLE<br/>0x1826"| espA
-    espA -->|"CPS BLE 0x1818<br/>power + cadence"| watch
-    espA -.->|"ESP-NOW"| espB
-    espA -.->|"ESP-NOW"| espC
-    espB -->|"CSC BLE 0x1816<br/>speed + distance"| watch
-    espC -->|"FTMS BLE 0x1826<br/>full Indoor Bike Data"| zwift
+flowchart TB
+    subgraph A["Option A — Standalone Zwift / TrainerRoad / etc."]
+        bikeA["Yesoul"] -->|FTMS BLE| c6A["1× ESP32-C6<br/>Yesoul_FTMS"]
+        c6A -->|FTMS BLE| zwiftA["Zwift / TR / etc."]
+    end
+    subgraph B["Option B — Garmin watch only"]
+        bikeB["Yesoul"] -->|FTMS BLE| pwrB["WROOM-32 Yesoul_PWR"]
+        pwrB -->|CPS| watchB["Garmin watch"]
+        pwrB -.ESP-NOW.-> spdB["WROOM-32 Yesoul_SPD"]
+        spdB -->|CSC| watchB
+    end
+    subgraph C["Option C — Garmin watch + Zwift simultaneously"]
+        bikeC["Yesoul"] -->|FTMS BLE| pwrC["WROOM-32 Yesoul_PWR"]
+        pwrC -->|CPS| watchC["Garmin watch"]
+        pwrC -.ESP-NOW.-> spdC["WROOM-32 Yesoul_SPD"]
+        pwrC -.ESP-NOW.-> trnC["ESP32-C6 Yesoul_FTMS"]
+        spdC -->|CSC| watchC
+        trnC -->|FTMS| zwiftC["Zwift / TR"]
+    end
 ```
 
-- **POWER ESP** owns the BLE connection to the bike, parses FTMS, publishes Cycling Power Service (power + cadence) to the watch, and broadcasts each parsed frame over ESP-NOW.
-- **SPEED ESP** receives over ESP-NOW (the bike allows only one BLE central, so the SPEED ESP doesn't talk to it directly), publishes Cycling Speed and Cadence Service (wheel-rev → speed/distance) to the watch.
-- **TRAINER ESP** also receives over ESP-NOW, re-emits FTMS Indoor Bike Data to indoor-cycling apps as a smart trainer. Implements Fitness Machine Control Point as a no-op so apps consider the device "controllable" (the Yesoul has a manual knob; we ACK commands but don't act on them).
+| Option | Hardware | Use case | Build env |
+|---|---|---|---|
+| **A — Standalone Zwift** | 1× **ESP32-C6** (Seeed XIAO recommended) | You ride Zwift / TR / etc. on a phone, tablet, or PC. Don't care about the Garmin watch. | `pio run -e trainer_c6` |
+| **B — Garmin watch only** | 2× **ESP32-WROOM-32** | You ride with a Garmin watch as your computer. No Zwift. | `pio run -e power` + `pio run -e speed` |
+| **C — Garmin watch + Zwift** | 2× WROOM-32 + 1× C6 (or 3× WROOM-32) | You want both — the watch records the ride natively, and Zwift sees a smart trainer in parallel. | All three: `power` + `speed` + (`trainer_c6` or `trainer`) |
 
-Why three devices: Garmin epix 2 firmware (2026) refuses to enumerate a single BLE peripheral that exposes both CPS and CSC under "Add Sensor → Speed". One sensor category per device is the only working topology with current Fenix 7 / epix 2 firmware. Adding the FTMS trainer for Zwift on the same chip as either Garmin role would re-trigger the same enumeration filter. Full evidence trail in [docs/JOURNEY.md](docs/JOURNEY.md).
-
-> A single ESP could probably do this with BLE 5.0 multi-advertising — I had three in a drawer and didn't try. The single-ESP path is being prototyped on an ESP32-C6 in [`single-esp-experiment`](../../tree/single-esp-experiment); see [docs/JOURNEY.md#what-i-didnt-try](docs/JOURNEY.md#what-i-didnt-try).
+The bike has only one BLE-central slot, so in Option C the WROOM-32 with the `power` role connects to the bike and broadcasts each parsed frame over ESP-NOW; the speed and trainer ESPs receive the relay rather than scanning the bike themselves.
 
 ## Hardware
 
 | Component | Notes |
-|-----------|-------|
-| 3× ESP32-WROOM-32 dev boards (CH340 USB-UART) | Any ESP32 should work; ESP-S3/C3 may need board target adjustment in `platformio.ini`. |
-| Yesoul G1M Plus indoor bike | Other FTMS bikes likely work but untested. |
-| Garmin epix 2 watch | Verified target. Other Fenix 7-class watches probably fine. Older Garmins or Edges may consume CPS+CSC on a single device — see [docs/JOURNEY.md](docs/JOURNEY.md). |
-| (Optional) PC/tablet/phone running Zwift / TrainerRoad / etc. | Pairs the TRAINER ESP as a smart trainer. |
+|---|---|
+| **ESP32-C6** (preferred for trainer / standalone roles) | Seeed XIAO ESP32-C6 (~AU$11). BLE 5.3, on-board PCB antenna, USB-C, single-board solution for Zwift use case. Requires the [pioarduino](https://github.com/pioarduino/platform-espressif32) PlatformIO platform fork (handled in `[env:trainer_c6]`). |
+| **ESP32-WROOM-32** (any classic ESP32) | The original CH340 dev boards. ~AU$10 each. Works for `power` / `speed` / `trainer` roles but not the `single-esp-experiment` branch (chip's BLE 4.2 doesn't support extended advertising — see [`docs/SINGLE_ESP_ATTEMPT.md`](docs/SINGLE_ESP_ATTEMPT.md) for that dead end). |
+| **Yesoul indoor bike** | Tested with the **G1M Plus**. The upstream tested with the **S3**. Other Yesoul models likely work; non-Yesoul FTMS bikes very likely work but are untested. |
+| **Garmin Fenix 7 / epix 2 / Edge** | Verified on epix 2. Older Garmins or Edges may consume CPS+CSC on a single device — see [`docs/JOURNEY.md`](docs/JOURNEY.md). |
+| **Phone / tablet / PC running Zwift** | Any modern Zwift-capable device. Tested on iPhone. |
 
 ## Build & flash
 
-PlatformIO via a Python venv (Brew's PlatformIO segfaulted on Python 3.14 at the time of writing):
+PlatformIO via a Python venv (the project predates Python 3.14 compatibility in PlatformIO and macOS Homebrew; the venv keeps things sane on any host):
 
 ```bash
 python3.13 -m venv .venv
 .venv/bin/pip install platformio intelhex
 ```
 
-Identify each ESP's serial port:
+Identify connected ESPs:
 
 ```bash
-.venv/bin/pio device list | grep usbserial
+.venv/bin/pio device list | grep -E 'usbserial|usbmodem'
+# WROOM-32 boards: /dev/cu.usbserial-XXX (CH340)
+# XIAO ESP32-C6:    /dev/cu.usbmodemXXX  (native USB-Serial/JTAG)
 ```
 
-Flash one as POWER, one as SPEED, one as TRAINER:
+Flash by role:
 
 ```bash
-.venv/bin/pio run -e power   -t upload --upload-port /dev/cu.usbserial-XXX
-.venv/bin/pio run -e speed   -t upload --upload-port /dev/cu.usbserial-YYY
-.venv/bin/pio run -e trainer -t upload --upload-port /dev/cu.usbserial-ZZZ
+# Option A — standalone Zwift on C6
+.venv/bin/pio run -e trainer_c6 -t upload --upload-port /dev/cu.usbmodemXXX
+
+# Option B — watch only (two WROOM-32s)
+.venv/bin/pio run -e power -t upload --upload-port /dev/cu.usbserial-AAA
+.venv/bin/pio run -e speed -t upload --upload-port /dev/cu.usbserial-BBB
+
+# Option C — add a third (C6 or WROOM-32) for Zwift
+.venv/bin/pio run -e trainer_c6 -t upload --upload-port /dev/cu.usbmodemCCC
+# or, on a WROOM-32:
+.venv/bin/pio run -e trainer    -t upload --upload-port /dev/cu.usbserial-CCC
 ```
 
-Watch serial output:
+Watch live serial output:
 
 ```bash
 .venv/bin/pio device monitor --port /dev/cu.usbserial-XXX
 ```
 
-## Pair on the watch
+## Pair on the watch (Options B and C)
 
 1. Settings → Sensors & Accessories → Add Sensor → **Power** → search → pair `Yesoul_PWR`.
-2. Add Sensor → **Speed** → search → pair `Yesoul_SPD`. Set **Wheel Size** to **2000 mm** in that sensor's details (matches `WHEEL_CIRCUMFERENCE_M` in firmware).
+2. Add Sensor → **Speed** → search → pair `Yesoul_SPD`. Set **Wheel Size** to **2000 mm** in that sensor's details (matches the firmware's `WHEEL_CIRCUMFERENCE_M`).
 3. Start a Bike Indoor activity and ride.
 
-## Pair in Zwift / TrainerRoad / similar
+## Pair in Zwift / TrainerRoad / similar (Options A and C)
 
-1. On the PC/tablet/phone running the app, open Devices / Pair Sensors.
-2. Search for a smart trainer — `Yesoul_FTMS` should appear under FTMS / Controllable.
+1. Open the app's Devices / Pair Sensors screen.
+2. Search for a smart trainer / FTMS device → `Yesoul_FTMS` should appear under FTMS / Controllable.
 3. Pair as a smart trainer. Power, cadence, speed, distance, resistance, energy, and elapsed time all flow.
-4. The Yesoul has a manual resistance knob. Apps can send simulated-gradient / target-power / target-resistance commands; the firmware ACKs them so the device is recognised as controllable, but it can't physically change the bike's resistance — turn the knob yourself.
+4. **Manual resistance**: the Yesoul has a physical knob, so the firmware ACKs Zwift's gradient/target-power commands but can't physically change the bike's resistance. Turn the knob yourself to feel hills or hit ERG targets. The visual / power-tracking / activity recording all work; you just drive resistance manually.
 
 ## Tests
 
@@ -101,19 +131,37 @@ Expected: `frames=45 legacy_match=45 ... PASS`.
 
 In [`src/main.cpp`](src/main.cpp):
 
-- `POWER_SCALE` (default `1.28f`) — empirical correction; the Yesoul under-reports relative to a calibrated power meter. Inherited from the upstream project. Recalibrate by riding at known watts on a reference meter and dividing reference / raw.
-- `WHEEL_CIRCUMFERENCE_M` (default `2.000f`) — wheel size used to synthesize wheel revolutions from speed. The watch must be configured with the same value (2000 mm) in the speed sensor's details.
-- `SIMULATE_BIKE` (default `false`) — flip to `true` to bench-test pairing without pedaling. The POWER ESP injects constant fake values (20 km/h, 60 RPM, 150 W) instead of connecting to the bike.
+- `POWER_SCALE` (default `1.00f`). The upstream Raelx project shipped `1.28f` based on a calibration whose methodology was never documented in the repo. This fork ships `1.0` so apps see exactly what the bike's own display shows. If you have a reference power meter and the bike under-reports against it, divide your reference by the bike's reported watts and set this to that ratio. One-line change, re-flash.
+- `WHEEL_CIRCUMFERENCE_M` (default `2.000f`). Used to synthesize wheel revolutions from bike-reported speed. The watch must use the same value (2000 mm) in its speed sensor settings.
+- `SIMULATE_BIKE` (default `false`). Flip to `true` to bench-test pairing without actually pedaling — the firmware injects constant fake values (20 km/h, 60 RPM, 150 W) and skips the bike-side BLE scan. Useful for diagnosing app-side connection issues.
 
-## Docs
+## Documentation
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — system topology, components, pairing flow, what's deliberately not shipped.
-- [docs/PROTOCOL.md](docs/PROTOCOL.md) — FTMS frame layout, parser, captures format, CPS / CSC re-emission.
-- [docs/JOURNEY.md](docs/JOURNEY.md) — every dead end and why we ended up at dual-ESP + ESP-NOW. Useful for fork maintainers.
-- [docs/captures/](docs/captures/) — ground-truth FTMS captures used as parser test fixtures.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system topology, components, every role's GATT structure, what each ESP does, what was deliberately not shipped.
+- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — FTMS Indoor Bike Data byte layout, parser, capture format, CPS / CSC / FTMS re-emission specifics.
+- [`docs/JOURNEY.md`](docs/JOURNEY.md) — the empirical trail of every dead end and decision. Includes the Garmin watch single-peripheral limit finding, the FTMS pass-through investigation, the BLE-5.0-on-ESP32-classic dead end, the standalone-C6 success, and citations for every claim.
+- [`docs/SINGLE_ESP_ATTEMPT.md`](docs/SINGLE_ESP_ATTEMPT.md) — the single-ESP-via-multi-advertising experiment that worked on iPhone but is fundamentally blocked on Garmin watches.
+- [`docs/captures/`](docs/captures/) — ground-truth FTMS captures from the bike, used as parser test fixtures.
+
+## Branches
+
+| Branch | Status |
+|---|---|
+| [`master`](https://github.com/Topherr/Yesoul_BLE/tree/master) | Production. All three deployment options live here. |
+| [`feature/ftms-trainer`](https://github.com/Topherr/Yesoul_BLE/tree/feature/ftms-trainer) | Where the Zwift-trainer support landed. Merged into master. |
+| [`single-esp-experiment`](https://github.com/Topherr/Yesoul_BLE/tree/single-esp-experiment) | Documented dead end — single ESP serving as both Power and Speed sensor for a Garmin watch via BLE 5.0 multi-advertising. Works on iPhone, blocked by Garmin firmware. |
 
 ## Known limitations
 
-- Single-bike, single-user device. The bike-side scan matches on FTMS service UUID `0x1826` alone — if there's another FTMS bike in range, it might connect to the wrong one. Add a name-prefix or MAC filter if needed.
-- Two ESPs is more hardware than ideal. See the "single-ESP" note above.
-- Resistance is parsed from the bike but not delivered to the watch — Garmin doesn't consume resistance from any standard BLE service.
+- **Single-bike, single-user.** The bike-side scan matches FTMS service UUID `0x1826` alone — if there's another FTMS device in range, behavior is undefined. Add a name-prefix or MAC filter in `ScanCallbacks::onResult` if needed.
+- **No electronic resistance control.** The Yesoul has a manual knob. Zwift's "smart trainer" commands are ACKed but can't be physically applied. A servo-on-knob upgrade would close the loop and is conceptually doable (~$15 hardware, ~30 LOC).
+- **POWER_SCALE is uncalibrated for *your* bike.** The upstream's 1.28 was empirically derived for a Yesoul S3; this fork ships 1.0 (raw watts) by default. Calibrate against a reference power meter if accuracy matters for training.
+- **Garmin Fenix 7 / epix 2 / Forerunner family caps at one BLE connection per physical peripheral.** This is the reason for the dual-WROOM-32 architecture in Option B / C; see `docs/JOURNEY.md` for the full evidence trail. Newer Garmins (Fenix 8+) may not have this limit — untested.
+
+## Acknowledgements
+
+- [**Raelx**](https://github.com/Raelx) and **Jeremy Mikesell** — original [Yesoul_BLE](https://github.com/Raelx/Yesoul_BLE), upstream of this fork. The CPS bridge pattern, NimBLE callback layout, and the 1.28 power-scale constant are theirs.
+- [**Imran Haque (PeloMon)**](https://ihaque.org/posts/2021/01/04/pelomon-part-iv-software/) — independently documented the Garmin-watch single-peripheral-connection limit on Fenix 5 in 2021. Saved this fork hours of "is it our code or theirs?" debugging.
+- [**h2zero (NimBLE-Arduino)**](https://github.com/h2zero/NimBLE-Arduino) — the BLE library this fork builds on. NimBLE 2.x is dramatically nicer than the older nkolban-ESP32-BLE-Arduino.
+- [**pioarduino**](https://github.com/pioarduino/platform-espressif32) — fork of PlatformIO's espressif32 that ships a recent enough Arduino-ESP32 to compile for ESP32-C6. Required for Option A.
+- [**teaandtechtime — Arduino BLE Cycling Power Service**](https://teaandtechtime.com/arduino-ble-cycling-power-service) — the explainer post the upstream cited that made the CPS frame layout legible.
