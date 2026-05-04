@@ -45,12 +45,15 @@ static constexpr const char* DEVICE_NAME =
     IS_POWER   ? "Yesoul_PWR" :
     IS_SPEED   ? "Yesoul_SPD" :
                  "Yesoul_FTMS";
-// Appearance: Cycling Power Sensor / Speed Sensor / generic Cycling for FTMS
-// (no specific Bluetooth SIG Appearance code for "indoor trainer").
+// Appearance: Cycling Power Sensor / Speed Sensor for the dedicated roles.
+// TRAINER also uses Power Sensor (0x0484) — Zwift filters by FTMS service
+// UUID and ignores Appearance, but the Garmin watch's "Add Sensor → Power"
+// flow filters by Appearance, and the dual-mode TRAINER wants the watch
+// to see it under that flow as well.
 static constexpr uint16_t DEVICE_APPEARANCE =
     IS_POWER   ? 0x0484 :
     IS_SPEED   ? 0x0482 :
-                 0x0480;
+                 0x0484;
 
 // SIMULATE_BIKE: bypass bike-side scan/connect entirely and inject realistic
 // mid-ride values into the publish pipeline. Useful for verifying pairing
@@ -466,8 +469,12 @@ void setup() {
 
   uint8_t loc[1] = { 0x0D };  // Rear Hub.
 
-  if (IS_POWER) {
-    // ---- CPS service (this ESP plays the role of a power meter) ----
+  // CPS service is exposed by POWER (its sole role) and also by TRAINER as a
+  // bonus channel — when the C6 is the only ESP in service, exposing CPS
+  // alongside FTMS lets a Garmin watch pair the same chip as a Power Meter
+  // (power + cadence) while Zwift simultaneously pairs it as an FTMS smart
+  // trainer. Two BLE clients, one chip.
+  if (IS_POWER || IS_TRAINER) {
     NimBLEService* cps = g_pServer->createService(CPS_SERVICE_UUID);
 
     NimBLECharacteristic* cpsFeature = cps->createCharacteristic(CPS_FEATURE_UUID, NIMBLE_PROPERTY::READ);
@@ -482,7 +489,8 @@ void setup() {
                                                  NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
     uint8_t initCps[8] = {0};
     g_cpsMeasurement->setValue(initCps, 8);
-  } else if (IS_SPEED) {
+  }
+  if (IS_SPEED) {
     // ---- CSC service (this ESP plays the role of a speed sensor) ----
     NimBLEService* csc = g_pServer->createService(CSC_SERVICE_UUID);
 
@@ -502,8 +510,9 @@ void setup() {
     NimBLECharacteristic* scControlPoint = csc->createCharacteristic(
         CSC_SC_CONTROL_POINT_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
     scControlPoint->setCallbacks(new SCControlPointCallbacks());
-  } else {
-    // ---- FTMS service (this ESP plays the role of a smart trainer for Zwift et al) ----
+  }
+  if (IS_TRAINER) {
+    // ---- FTMS service (smart trainer for Zwift et al) ----
     NimBLEService* ftms = g_pServer->createService(FTMS_SERVICE_UUID);
 
     NimBLECharacteristic* ftmsFeature = ftms->createCharacteristic(FTMS_FEATURE_UUID, NIMBLE_PROPERTY::READ);
@@ -535,11 +544,14 @@ void setup() {
   g_pServer->start();
 
   // ---- Advertising ----
+  // TRAINER advertises FTMS first (so Zwift's smart-trainer search lists us
+  // earlier in the rendered packet) and CPS second (so the Garmin watch's
+  // Add Sensor → Power flow can also see us). 31-byte legacy adv budget
+  // accommodates two 16-bit UUIDs + name + appearance + flags.
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->addServiceUUID(
-      IS_POWER ? CPS_SERVICE_UUID :
-      IS_SPEED ? CSC_SERVICE_UUID :
-                 FTMS_SERVICE_UUID);
+  if (IS_POWER || IS_TRAINER) adv->addServiceUUID(CPS_SERVICE_UUID);
+  if (IS_SPEED)               adv->addServiceUUID(CSC_SERVICE_UUID);
+  if (IS_TRAINER)             adv->addServiceUUID(FTMS_SERVICE_UUID);
   adv->setAppearance(DEVICE_APPEARANCE);
   adv->setName(DEVICE_NAME);
   adv->enableScanResponse(false);
@@ -547,7 +559,7 @@ void setup() {
   const char* role_label =
       IS_POWER   ? "POWER/CPS" :
       IS_SPEED   ? "SPEED/CSC" :
-                   "TRAINER/FTMS";
+                   "TRAINER/FTMS+CPS";
   Serial.printf("[srv] advertising as %s (role=%s)\n", DEVICE_NAME, role_label);
 
   // ---- Bike-side scan setup ----
@@ -664,11 +676,16 @@ void loop() {
                   (int)g_inst_power_w, (int)g_pServer->getConnectedCount());
     last_logged_notifies = notifies;
     if (g_pServer->getConnectedCount() > 0) {
-      // Crank/wheel-rev counters are only needed for CPS/CSC, not FTMS.
-      if (IS_POWER || IS_SPEED) update_revolution_counters();
-      if (IS_POWER)        publish_cps_frame();
-      else if (IS_SPEED)   publish_csc_frame();
-      else                 publish_ftms_frame();
+      // POWER and SPEED need the rev counters for their respective frames.
+      // TRAINER needs them too because it now also publishes a CPS frame
+      // (alongside FTMS) so a Garmin watch can pair the same chip.
+      if (IS_POWER || IS_SPEED || IS_TRAINER) update_revolution_counters();
+      if (IS_POWER)      publish_cps_frame();
+      else if (IS_SPEED) publish_csc_frame();
+      else {  // IS_TRAINER — publish both FTMS (Zwift) and CPS (Garmin watch)
+        publish_ftms_frame();
+        publish_cps_frame();
+      }
     }
   }
 

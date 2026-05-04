@@ -104,6 +104,27 @@ Tested with iPhone Zwift on 2026-05-01. All four metrics (power, cadence, speed,
 
 If the C6 is plugged in alongside the dual-WROOM-32 watch setup, the bike's one-central limit kicks in: POWER scans first, wins the bike, and the C6's bike-side scan fails to connect → falls back automatically to receiving over ESP-NOW (the recv callback is registered for any role that isn't POWER). All three deployment options now work from one source tree.
 
+### 11. Dual-mode trainer: FTMS + CPS on a single C6
+
+After getting standalone Zwift working on the C6, the obvious next question: can the same C6 also expose CPS to a Garmin watch in parallel? The single-esp-experiment branch proved that **CPS + CSC** on a single chip is filtered out by Garmin Fenix-class firmware. But what about **CPS + FTMS**?
+
+FTMS isn't a sensor category Garmin Fenix-class watches actually consume — there's no "Add Sensor → Indoor Trainer over BLE" path on epix 2 in 2026 firmware (the menu exists but it's ANT+ FE-C only). So FTMS would just be ignored by the watch's enumerator while still being visible to Zwift. CPS, meanwhile, would land cleanly under "Add Sensor → Power".
+
+20 LOC change to the TRAINER role:
+
+- Create the CPS service alongside FTMS in `setup()`.
+- Add `CPS_SERVICE_UUID` to the advertising packet (still fits the 31-byte legacy adv budget alongside FTMS UUID + name + appearance + flags).
+- Bump TRAINER's Appearance from `0x0480` (Cycling, generic) to `0x0484` (Cycling Power Sensor) so the watch's "Add Sensor → Power" filter passes.
+- In the publish loop, call both `publish_cps_frame()` and `publish_ftms_frame()` per second. CPS frames re-use the crank-rev counter that POWER and SPEED roles maintain.
+
+Empirically validated: epix 2 lists `Yesoul_FTMS` under "Add Sensor → Power" and pairs cleanly. iPhone Zwift simultaneously pairs the same chip as a smart trainer over FTMS. Both connections hold (`conns=2` on serial). Watch's Bike Indoor activity records power and cadence natively while Zwift gets the full smart-trainer payload.
+
+This collapses Option A from "Zwift only" to **"Zwift + Garmin watch (power+cadence) on one chip"**. For most users, that's the whole project on a single board.
+
+The trade-off: Option A still doesn't get speed/distance into the watch's activity record because adding CSC to the same chip would re-trigger the Garmin watch's CPS+CSC dedup filter (the wall the single-esp-experiment branch hit). Indoor speed/distance is mostly cosmetic — `cadence × wheel-circumference × time` with no environmental data — so most cyclists shrug at the loss. Riders who specifically want speed/distance recorded on the watch fall back to Options B (dual-WROOM-32) or C (dual-WROOM-32 + C6 trainer).
+
+The lesson: **Garmin's CPS+CSC dedup filter is specific to those two services together on one peripheral, not a blanket "one BLE service category per peripheral" rule.** FTMS coexists with CPS without trouble. Probably also coexists with CSC, but not relevant for this fork.
+
 ## What I didn't try
 
 - **Per-connection GATT subset on a single chip.** The single-ESP path could theoretically work if NimBLE supported showing CPS to one address's connections and CSC to the other's — Garmin's connection-manager policy might be sidestepped if each address looked like a structurally distinct device end-to-end. NimBLE 2.x's `ble_gatts_svc_set_visibility` is global, not per-connection. Forking mynewt-nimble to add per-connection visibility is a rewrite, not a tweak. Probably not worth the effort given the dual-WROOM-32 path works.

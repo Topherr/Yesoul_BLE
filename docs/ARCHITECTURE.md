@@ -14,19 +14,28 @@ The same firmware compiles for one of three roles, selected by build flag in [`p
 
 ## Three deployment topologies
 
-### Option A — Standalone Zwift / TrainerRoad / etc.
+### Option A — Single C6 (Zwift smart trainer + Garmin watch power meter)
 
 ```mermaid
 flowchart LR
     bike["Yesoul"]
     c6["ESP32-C6<br/><b>Yesoul_FTMS</b>"]
     zwift["Zwift / TR / etc.<br/>(phone, tablet, PC)"]
+    watch["Garmin watch"]
 
     bike -->|"FTMS BLE 0x1826<br/>Indoor Bike Data"| c6
     c6 -->|"FTMS BLE 0x1826<br/>full Indoor Bike Data"| zwift
+    c6 -->|"CPS BLE 0x1818<br/>power + cadence"| watch
 ```
 
-Single ESP32-C6 (recommended) or any ESP32 in the `trainer` role. Connects to the bike directly, parses, re-emits FTMS to the app with `POWER_SCALE` applied to the inst-power field. Implements Fitness Machine Control Point with a no-op handler so Zwift recognises the device as "controllable" (the Yesoul has a manual resistance knob; we ACK gradient/target-power commands but can't physically apply them).
+Single ESP32-C6 (recommended) or any ESP32 in the `trainer` role. Connects to the bike directly, parses each FTMS Indoor Bike Data frame, and exposes **two services in parallel**:
+
+- **FTMS (`0x1826`)** for indoor-cycling apps. Full payload — power, cadence, speed, distance, resistance, energy, elapsed time. Implements Fitness Machine Control Point with a no-op handler that ACKs Zwift's documented start sequence (Request Control → Reset → Start → Set Indoor Bike Simulation Parameters); the Yesoul has a manual resistance knob so we can't physically apply the commands but the contract is honoured at the BLE layer.
+- **CPS (`0x1818`)** for Garmin watches. Power and cadence stream natively into the watch's Bike Indoor activity. The watch's "Add Sensor → Power" flow lists `Yesoul_FTMS` (the device's Appearance is set to `0x0484` Cycling Power Sensor specifically so this filter passes).
+
+The watch holds one BLE connection to the chip, Zwift holds another, and the C6's NimBLE stack handles both concurrently. Empirically validated against epix 2 + iPhone Zwift.
+
+The trade-off vs. Options B/C: speed/distance does not flow into the watch's activity record. CSC alongside CPS+FTMS on a single chip would re-trigger the same Garmin watch firmware filter that broke the single-esp-experiment branch (one connection per peripheral when CPS+CSC coexist on one MAC). For most riders this trade-off is fine: indoor speed/distance is cosmetic, while power+cadence are the metrics every training stat is built on.
 
 ### Option B — Garmin watch only
 
@@ -114,15 +123,22 @@ No globals shared mutably across tasks.
 
 | | POWER role | SPEED role | TRAINER role |
 |---|---|---|---|
-| Service | CPS (`0x1818`) | CSC (`0x1816`) | FTMS (`0x1826`) |
+| Services | CPS (`0x1818`) | CSC (`0x1816`) | FTMS (`0x1826`) **+** CPS (`0x1818`) |
 | Name | `Yesoul_PWR` | `Yesoul_SPD` | `Yesoul_FTMS` |
-| Appearance | `0x0484` (Cycling Power Sensor) | `0x0482` (Cycling Speed Sensor) | `0x0480` (Cycling, generic) |
-| Feature bitmap | `0x00000008` (crank-rev) | `0x0001` (wheel-rev) | `0x00005286` (cadence + distance + resistance + energy + elapsed + power) |
-| Measurement frame | 8 bytes, flags `0x0020` | 7 bytes, flags `0x01` | 22 bytes, flags `0x09F4` (mirrors the Yesoul's payload exactly) |
-| Layout | `[flags][power_s16][crank_revs_u16][last_crank_event_time_u16]` | `[flags][cumulative_wheel_revs_u32][last_wheel_event_time_u16]` | `[flags][speed][cadence][distance_u24][resistance][inst_power][avg_power][total_energy][energy/hr][energy/min][elapsed]` |
-| Event-time units | 1/1024 s | 1/1024 s | n/a |
+| Appearance | `0x0484` (Cycling Power Sensor) | `0x0482` (Cycling Speed Sensor) | `0x0484` (Cycling Power Sensor — also satisfies Garmin's "Add Sensor → Power" filter) |
+| FTMS Feature bitmap | n/a | n/a | `0x00005286` (cadence + distance + resistance + energy + elapsed + power) |
+| CPS Feature bitmap | `0x00000008` (crank-rev) | n/a | `0x00000008` (crank-rev) |
+| CSC Feature bitmap | n/a | `0x0001` (wheel-rev) | n/a |
+| FTMS Measurement frame | n/a | n/a | 22 bytes, flags `0x09F4` (mirrors the Yesoul's payload exactly) |
+| CPS Measurement frame | 8 bytes, flags `0x0020` | n/a | 8 bytes, flags `0x0020` |
+| CSC Measurement frame | n/a | 7 bytes, flags `0x01` | n/a |
+| Frame layouts (CPS / CSC / FTMS) | CPS: `[flags][power_s16][crank_revs_u16][last_crank_event_time_u16]` | CSC: `[flags][cumulative_wheel_revs_u32][last_wheel_event_time_u16]` | FTMS: `[flags][speed][cadence][distance_u24][resistance][inst_power][avg_power][total_energy][energy/hr][energy/min][elapsed]` ; CPS: same as POWER role |
+| Event-time units | 1/1024 s | 1/1024 s | 1/1024 s (CPS frame) |
 | Control Point | — | SC Control Point (no-op) | Fitness Machine Control Point (no-op, ACKs Request Control + Reset + Start/Resume + Stop/Pause + Set Target Power + Set Indoor Bike Simulation Parameters — Zwift's required sequence) |
 | Bike-side BLE central | yes | no — ESP-NOW receiver only | yes (with ESP-NOW receiver as fallback) |
+| Concurrent client connections | 1 (Garmin watch) | 1 (Garmin watch) | 2 (Garmin watch on CPS + Zwift on FTMS) |
+
+The TRAINER role exposing both FTMS and CPS at once is the basis of Option A. Each remote client (the watch on CPS, Zwift on FTMS) holds an independent BLE connection to the chip. The Garmin Fenix-class one-connection-per-peripheral firmware policy applies per-peripheral, and the chip serves both connections simultaneously without trip — empirically validated. The same trick does NOT extend to also adding CSC: CPS+CSC on the same chip is the specific combination that triggers Garmin's enumeration-side dedup filter (see [`JOURNEY.md`](JOURNEY.md)).
 
 - Bonding intentionally OFF (`setSecurityAuth` not called). Enabling it caused stale-bond mismatches when the watch removed a sensor on its side.
 - Each notification publishes only when at least one BLE client is connected on that ESP.

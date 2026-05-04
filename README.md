@@ -26,17 +26,18 @@ The first commits in this repo's history are theirs (`414aad8 Scaling for Power`
 
 ```mermaid
 flowchart TB
-    subgraph A["Option A — Standalone Zwift / TrainerRoad / etc."]
+    subgraph A["Option A — Single C6 (Zwift + Garmin watch power/cadence)"]
         bikeA["Yesoul"] -->|FTMS BLE| c6A["1× ESP32-C6<br/>Yesoul_FTMS"]
-        c6A -->|FTMS BLE| zwiftA["Zwift / TR / etc."]
+        c6A -->|"FTMS BLE<br/>full smart trainer"| zwiftA["Zwift / TR / etc."]
+        c6A -->|"CPS BLE<br/>power + cadence"| watchA["Garmin watch"]
     end
-    subgraph B["Option B — Garmin watch only"]
+    subgraph B["Option B — Watch-only with speed/distance (no Zwift)"]
         bikeB["Yesoul"] -->|FTMS BLE| pwrB["WROOM-32 Yesoul_PWR"]
         pwrB -->|CPS| watchB["Garmin watch"]
         pwrB -.ESP-NOW.-> spdB["WROOM-32 Yesoul_SPD"]
         spdB -->|CSC| watchB
     end
-    subgraph C["Option C — Garmin watch + Zwift simultaneously"]
+    subgraph C["Option C — Watch with speed/distance + Zwift simultaneously"]
         bikeC["Yesoul"] -->|FTMS BLE| pwrC["WROOM-32 Yesoul_PWR"]
         pwrC -->|CPS| watchC["Garmin watch"]
         pwrC -.ESP-NOW.-> spdC["WROOM-32 Yesoul_SPD"]
@@ -46,13 +47,17 @@ flowchart TB
     end
 ```
 
-| Option | Hardware | Use case | Build env |
-|---|---|---|---|
-| **A — Standalone Zwift** | 1× **ESP32-C6** (Seeed XIAO recommended) | You ride Zwift / TR / etc. on a phone, tablet, or PC. Don't care about the Garmin watch. | `pio run -e trainer_c6` |
-| **B — Garmin watch only** | 2× **ESP32-WROOM-32** | You ride with a Garmin watch as your computer. No Zwift. | `pio run -e power` + `pio run -e speed` |
-| **C — Garmin watch + Zwift** | 2× WROOM-32 + 1× C6 (or 3× WROOM-32) | You want both — the watch records the ride natively, and Zwift sees a smart trainer in parallel. | All three: `power` + `speed` + (`trainer_c6` or `trainer`) |
+| Option | Hardware | Watch metrics | Zwift | Build env |
+|---|---|---|---|---|
+| **A — Single C6** *(recommended for most users)* | 1× **ESP32-C6** (Seeed XIAO recommended) | power + cadence | full smart trainer | `pio run -e trainer_c6` |
+| **B — Watch-only with speed/distance** | 2× **ESP32-WROOM-32** | power + cadence + speed + distance | — | `pio run -e power` + `pio run -e speed` |
+| **C — Speed/distance on watch + Zwift** | 2× WROOM-32 + 1× C6 (or 3× WROOM-32) | power + cadence + speed + distance | full smart trainer | `pio run -e power` + `pio run -e speed` + (`trainer_c6` or `trainer`) |
 
-The bike has only one BLE-central slot, so in Option C the WROOM-32 with the `power` role connects to the bike and broadcasts each parsed frame over ESP-NOW; the speed and trainer ESPs receive the relay rather than scanning the bike themselves.
+**Most users want Option A.** It's a single-board solution that gives a Garmin watch power and cadence (the metrics that actually matter for training) and Zwift a full smart-trainer payload — power, cadence, speed, distance, resistance, energy, elapsed time. The trade-off vs. Option B/C is that the watch doesn't get speed/distance recorded natively (Garmin Fenix-class firmware caps at one BLE connection per physical peripheral, and CPS+CSC on the same chip trips a separate dedup filter — see [`docs/JOURNEY.md`](docs/JOURNEY.md)).
+
+Indoor speed/distance on the watch is mostly cosmetic (it's just `cadence × wheel-circumference × time` with no environmental data) so most cyclists pick Option A and call it done. Riders who specifically want the watch's activity record to include those fields go to Option B or C.
+
+In Options B and C the bike's one-BLE-central limit is bypassed by ESP-NOW — the WROOM-32 with the `power` role connects to the bike and broadcasts each parsed frame over its 2.4 GHz radio; the speed and trainer ESPs receive the relay rather than scanning the bike themselves.
 
 ## Hardware
 
@@ -103,18 +108,29 @@ Watch live serial output:
 .venv/bin/pio device monitor --port /dev/cu.usbserial-XXX
 ```
 
-## Pair on the watch (Options B and C)
+## Pair on the watch
+
+### Option A (single C6)
+
+1. Settings → Sensors & Accessories → Add Sensor → **Power** → search → pair `Yesoul_FTMS`.
+2. Start a Bike Indoor activity and ride. Power and cadence flow.
+
+(Speed / distance won't be available — they live on the FTMS service which Zwift consumes, but Garmin watches don't read FTMS as a sensor.)
+
+### Options B and C (dual-WROOM-32 with separate Power and Speed sensors)
 
 1. Settings → Sensors & Accessories → Add Sensor → **Power** → search → pair `Yesoul_PWR`.
 2. Add Sensor → **Speed** → search → pair `Yesoul_SPD`. Set **Wheel Size** to **2000 mm** in that sensor's details (matches the firmware's `WHEEL_CIRCUMFERENCE_M`).
-3. Start a Bike Indoor activity and ride.
+3. Start a Bike Indoor activity and ride. All four metrics flow.
+
+In Option C the C6's `Yesoul_FTMS` will also appear under "Add Sensor → Power" (it advertises CPS too). Don't pair it on the watch — the dedicated `Yesoul_PWR` is the one with the Garmin-watch story; pair `Yesoul_FTMS` only with Zwift.
 
 ## Pair in Zwift / TrainerRoad / similar (Options A and C)
 
 1. Open the app's Devices / Pair Sensors screen.
 2. Search for a smart trainer / FTMS device → `Yesoul_FTMS` should appear under FTMS / Controllable.
 3. Pair as a smart trainer. Power, cadence, speed, distance, resistance, energy, and elapsed time all flow.
-4. **Manual resistance**: the Yesoul has a physical knob, so the firmware ACKs Zwift's gradient/target-power commands but can't physically change the bike's resistance. Turn the knob yourself to feel hills or hit ERG targets. The visual / power-tracking / activity recording all work; you just drive resistance manually.
+4. **Manual resistance**: the Yesoul has a physical knob, so the firmware ACKs Zwift's gradient / target-power / Set Indoor Bike Simulation commands (Zwift's documented start sequence) but can't physically change the bike's resistance. Turn the knob yourself to feel hills or hit ERG targets. The visual / power-tracking / activity recording all work; you just drive resistance manually.
 
 ## Tests
 
