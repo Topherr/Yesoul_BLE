@@ -10,6 +10,10 @@ work landed. Pre-fork upstream tags are listed under
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## 2026-05-17 — bike-side reconnect reliability
+
 ### Fixed
 - **Bike-side reconnect reliability.** The firmware no longer needs a USB
   power-cycle when returning to a powered-off bike. Three real failure modes
