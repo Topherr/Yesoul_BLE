@@ -6,6 +6,7 @@
 #include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_task_wdt.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include "ftms_parser.h"
@@ -66,6 +67,8 @@ static constexpr int16_t  SIM_INST_POWER_W         = 150;
 static constexpr float    POWER_SCALE              = 1.00f;  // 1.28 = upstream-inherited calibration vs. a reference power meter; 1.00 = trust the bike's raw watts
 static constexpr float    WHEEL_CIRCUMFERENCE_M    = 2.000f;
 static constexpr uint32_t NOTIFICATION_WATCHDOG_MS = 5000;
+static constexpr uint32_t STUCK_STATE_WATCHDOG_MS  = 5UL * 60 * 1000;   // any non-streaming state held this long → force a fresh disconnect/scan cycle
+static constexpr uint32_t TASK_WDT_TIMEOUT_MS      = 60000;             // catches a fully wedged loop()/NimBLE; well above the 30 s NimBLE supervision timeout
 static constexpr uint32_t COOLDOWN_MS              = 1000;
 static constexpr uint32_t SCAN_BACKOFF_INITIAL_MS  = 5000;
 static constexpr uint32_t SCAN_BACKOFF_MAX_MS      = 60000;
@@ -88,8 +91,15 @@ static const NimBLEUUID CSC_FEATURE_UUID("2A5C");
 static const NimBLEUUID CSC_SC_CONTROL_POINT_UUID("2A55");
 
 // ---- Bike-side state machine ----
+// S_CONNECTING is a transient state set by loop() before it calls the blocking
+// connect_to_target(). Its job is to close a use-after-free window on
+// g_pTarget: ScanCallbacks::onResult runs on the NimBLE host task and only
+// fires when g_state == S_SCANNING, so promoting to S_CONNECTING before the
+// connect call prevents a second advert from freeing g_pTarget while connect
+// is dereferencing it.
 enum BikeState {
   S_SCANNING,
+  S_CONNECTING,
   S_CONNECTED,
   S_STREAMING,
   S_DISCONNECTED,
@@ -99,6 +109,10 @@ enum BikeState {
 static volatile BikeState g_state                  = S_SCANNING;
 static volatile uint32_t  g_last_notification_ms   = 0;
 static volatile bool      g_doConnect              = false;
+static volatile int       g_last_disconnect_reason = 0;
+static volatile bool      g_have_disconnect_reason = false;
+static BikeState          g_prev_state             = S_SCANNING;
+static uint32_t           g_last_state_change_ms   = 0;
 static uint32_t           g_scan_backoff_ms        = SCAN_BACKOFF_INITIAL_MS;
 static uint32_t           g_cooldown_started_ms    = 0;
 static uint32_t           g_consecutive_failures   = 0;
@@ -223,7 +237,16 @@ class SCControlPointCallbacks : public NimBLECharacteristicCallbacks {
 class ClientCallbacks : public NimBLEClientCallbacks {
   void onDisconnect(NimBLEClient* pClient, int reason) override {
     Serial.printf("[bike] disconnected (reason=0x%x)\n", reason);
-    g_state = S_DISCONNECTED;
+    g_last_disconnect_reason = reason;
+    g_have_disconnect_reason = true;
+    // Only honour the disconnect if we currently believe we have a live
+    // session. A delayed supervision-timeout disconnect that fires after the
+    // loop has already moved on to S_COOLDOWN/S_SCANNING must not yank us back
+    // — that would re-enter cleanup against a null g_pClient.
+    BikeState s = g_state;
+    if (s == S_CONNECTING || s == S_CONNECTED || s == S_STREAMING) {
+      g_state = S_DISCONNECTED;
+    }
   }
 } g_clientCallbacks;
 
@@ -315,6 +338,10 @@ static bool connect_to_target() {
     g_pClient = nullptr;
   }
   g_pClient = NimBLEDevice::createClient();
+  // NimBLE-Arduino 2.x: setConnectTimeout takes MILLISECONDS (was seconds in
+  // 1.x — common footgun). 10 s is generous for a healthy bike and bounds the
+  // loop()-blocking window well under the task WDT timeout.
+  g_pClient->setConnectTimeout(10000);
   g_pClient->setClientCallbacks(&g_clientCallbacks, false);
   if (!g_pClient->connect(g_pTarget)) {
     NimBLEDevice::deleteClient(g_pClient);
@@ -334,7 +361,13 @@ static bool connect_to_target() {
 }
 
 static void start_scan() {
-  Serial.printf("[bike] scanning...\n");
+  if (g_have_disconnect_reason) {
+    Serial.printf("[bike] scanning... (recovering from disconnect reason=0x%x)\n",
+                  g_last_disconnect_reason);
+    g_have_disconnect_reason = false;
+  } else {
+    Serial.printf("[bike] scanning...\n");
+  }
   g_state = S_SCANNING;
   NimBLEDevice::getScan()->start(0, false, true);
 }
@@ -452,6 +485,26 @@ void setup() {
     Serial.printf("[sim] BIKE SIMULATION ENABLED — speed=%.2fkmh, cadence=%uRPM, raw_power=%dW\n",
                   SIM_SPEED_CMPS / 100.0, SIM_CADENCE_HALFRPM / 2, (int)SIM_INST_POWER_W);
   }
+
+  // Belt-and-braces: if loop() ever wedges (NimBLE host-task hang, scanner
+  // stuck after a long idle, whatever), the task WDT panics and resets the
+  // chip. Arduino-ESP32 3.x does NOT auto-subscribe the loopTask (the core
+  // sets loopTaskWDTEnabled=false at boot), so we must subscribe explicitly —
+  // setup() runs on the loopTask, so esp_task_wdt_add(NULL) registers it.
+  // idle_core_mask = (1 << portNUM_PROCESSORS) - 1 keeps the per-core idle
+  // tasks subscribed (0x1 on the single-core C6, 0x3 on the WROOM-32) so a
+  // higher-priority task hogging a core also trips the WDT.
+  {
+    esp_task_wdt_config_t wdt_cfg = {};
+    wdt_cfg.timeout_ms     = TASK_WDT_TIMEOUT_MS;
+    wdt_cfg.idle_core_mask = (1u << portNUM_PROCESSORS) - 1u;
+    wdt_cfg.trigger_panic  = true;
+    esp_err_t wdt_err = esp_task_wdt_reconfigure(&wdt_cfg);
+    if (wdt_err != ESP_OK) Serial.printf("[wdt] reconfigure failed: %d\n", (int)wdt_err);
+    wdt_err = esp_task_wdt_add(NULL);
+    if (wdt_err != ESP_OK) Serial.printf("[wdt] add(loopTask) failed: %d\n", (int)wdt_err);
+  }
+  g_last_state_change_ms = millis();
 
   g_frameQueue = xQueueCreate(8, sizeof(BikeFrame));
 
@@ -591,6 +644,8 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();
+
   // 0. Bike simulation overlay: inject constant values and keep state forced.
   if (SIMULATE_BIKE) {
     g_speed_cmps           = SIM_SPEED_CMPS;
@@ -621,18 +676,30 @@ void loop() {
   if ((IS_POWER || IS_TRAINER) && !SIMULATE_BIKE) {
     if (g_doConnect) {
       g_doConnect = false;
-      if (connect_to_target()) {
+      // Promote out of S_SCANNING before the blocking connect: ScanCallbacks
+      // ignores results unless state == S_SCANNING, so this stops a second
+      // advert from freeing g_pTarget while connect_to_target() reads it.
+      g_state = S_CONNECTING;
+      bool connected = connect_to_target();
+      // While connect() was blocking, the host task may have already fired
+      // onDisconnect (post-subscribe supervision drop, bike rejecting us,
+      // etc.) and moved g_state to S_DISCONNECTED. Don't clobber that with
+      // S_CONNECTED / S_COOLDOWN — let the existing S_DISCONNECTED cleanup
+      // path handle teardown instead of skipping it.
+      if (connected) {
         Serial.println("[bike] connected, subscribed to FTMS Indoor Bike Data");
-        g_state = S_CONNECTED;
         g_consecutive_failures = 0;
+        if (g_state == S_CONNECTING) g_state = S_CONNECTED;
       } else {
         Serial.println("[bike] connect failed");
         g_consecutive_failures++;
         uint32_t shift = g_consecutive_failures > 4 ? 4 : g_consecutive_failures - 1;
         uint32_t b = SCAN_BACKOFF_INITIAL_MS << shift;
         g_scan_backoff_ms = b > SCAN_BACKOFF_MAX_MS ? SCAN_BACKOFF_MAX_MS : b;
-        g_state = S_COOLDOWN;
-        g_cooldown_started_ms = millis();
+        if (g_state == S_CONNECTING) {
+          g_state = S_COOLDOWN;
+          g_cooldown_started_ms = millis();
+        }
       }
     }
 
@@ -640,6 +707,25 @@ void loop() {
         (millis() - g_last_notification_ms) > NOTIFICATION_WATCHDOG_MS) {
       Serial.println("[bike] watchdog: no notifications for 5 s");
       g_state = S_DISCONNECTED;
+    }
+
+    // Stuck-state watchdog: catches anything the 5 s notification watchdog
+    // doesn't — S_CONNECTING hangs, S_CONNECTED with subscribe done but no
+    // frames ever arriving, scanner that's been running so long it's silently
+    // stopped finding adverts, S_COOLDOWN that never advances. S_STREAMING is
+    // excluded (legitimate steady state — the 5 s watchdog covers it).
+    {
+      BikeState s = g_state;
+      if (s != g_prev_state) {
+        g_prev_state = s;
+        g_last_state_change_ms = millis();
+      } else if (s != S_STREAMING &&
+                 (millis() - g_last_state_change_ms) > STUCK_STATE_WATCHDOG_MS) {
+        Serial.printf("[bike] stuck-state watchdog: state=%d unchanged for 5 min, forcing recovery\n",
+                      (int)s);
+        g_state = S_DISCONNECTED;
+        g_last_state_change_ms = millis();
+      }
     }
 
     if (g_state == S_DISCONNECTED) {
