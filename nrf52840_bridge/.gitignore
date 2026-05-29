@@ -1,0 +1,5 @@
+# Nordic SDK build artefacts
+_build/
+
+# macOS noise
+.DS_Store
